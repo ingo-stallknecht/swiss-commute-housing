@@ -24,3 +24,8 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local caches / large raw
+data/gemeinden_cache.geojson
+data/gtfs/**
+data/artifacts/**

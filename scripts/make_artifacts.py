@@ -1,277 +1,350 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Builds app/data/* artifacts from local inputs:
-- data/vacancy_municipality.csv      (BFS-style vacancy rates per municipality)
-- data/gtfs_train.zip                (GTFS bundle)
+Builds artifacts for the app:
+- Download/prepare Swiss Gemeinden geometries
+- Read vacancy CSV
+- (Optionally) compute commute metrics (requires GTFS; omitted here)
+- Produce simplified GeoJSON + meta.json
+- Copy minimal files to app/data/
 
-Outputs (primary):
-- data/artifacts/gemeinden.geojson
-- data/artifacts/gemeinden_simplified.geojson
-- data/artifacts/gemeinden_centroids.parquet
-- data/artifacts/gemeinden.csv
-- data/artifacts/meta.json
-- app/data/{gemeinden.geojson, gemeinden_simplified.geojson, meta.json}
+Usage:
+    python scripts/make_artifacts.py [--fresh] [--only-simplified]
 
-Optional convenience (single-origin table so the app shows a selector):
-- app/data/tt_by_origin.csv
-
-Run:
-  .venv/Scripts/python scripts/make_artifacts.py
+Flags:
+    --fresh            Ignore cached Gemeinde GeoJSON and re-download.
+    --only-simplified  Export only the simplified GeoJSON (skips full file).
 """
-from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 import zipfile
 from pathlib import Path
-from typing import Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-# --- local package imports
-from sch.geo_utils import CRS_CH, CRS_WGS84, norm_name, safe_to_crs
-from sch.gtfs_graph import build_station_graph, compute_commute_minutes_from
-from sch.io_utils import parse_percent, read_bfs_like_csv
-from sch.scoring import blend_preference
-
-# ---------- Paths ----------
+# ---------------- Paths ----------------
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-RAW = DATA / "raw"
+RAW = DATA
 ART = DATA / "artifacts"
 APP_DATA = ROOT / "app" / "data"
+
 ART.mkdir(parents=True, exist_ok=True)
 APP_DATA.mkdir(parents=True, exist_ok=True)
 
-# Inputs can be either in data/ or data/raw/
-VACANCY_CSV = (
-    (DATA / "vacancy_municipality.csv")
-    if (DATA / "vacancy_municipality.csv").exists()
-    else (RAW / "vacancy_municipality.csv")
-)
-GTFS_ZIP = (
-    (DATA / "gtfs_train.zip") if (DATA / "gtfs_train.zip").exists() else (RAW / "gtfs_train.zip")
-)
+VACANCY_CSV = RAW / "vacancy_municipality.csv"
+GTFS_ZIP = RAW / "gtfs_train.zip"
 
-# Default origin for precomputed travel times (also used if dynamic origins are missing)
-ORIGIN_STATION = "Zürich HB"
+CACHE_GEMEINDEN = DATA / "gemeinden_cache.geojson"
 
-# Cache for geometries (avoid re-downloading each run)
-GEM_CACHE = DATA / "gemeinden_cache.geojson"
+CRS_CH = "EPSG:2056"
+CRS_WGS84 = "EPSG:4326"
 
 
-# ---------- Helpers ----------
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def safe_to_crs(gdf, crs):
+    g = gdf.copy()
+    try:
+        if g.crs is None:
+            return g.set_crs(crs)
+        elif str(g.crs).lower() != str(crs).lower():
+            return g.to_crs(crs)
+    except Exception:
+        pass
+    return g
 
 
-def sanity_inputs() -> None:
-    log("▶ Sanity check for input files")
-    for path, label in [(VACANCY_CSV, "vacancy_municipality.csv"), (GTFS_ZIP, "gtfs_train.zip")]:
-        status = "OK" if Path(path).exists() else "MISSING"
-        print(f"  • {Path(path).resolve()} : {status}")
-    assert VACANCY_CSV.exists(), f"Missing file: {VACANCY_CSV}"
-    assert GTFS_ZIP.exists(), f"Missing file: {GTFS_ZIP}"
+def parse_percent(x):
+    if x is None:
+        return np.nan
+    s = str(x).strip()
+    if not s:
+        return np.nan
+    s = (
+        s.replace("\xa0", " ")
+        .replace("%", "")
+        .replace("’", "")
+        .replace("'", "")
+        .replace(" ", "")
+        .replace(",", ".")
+    )
+    try:
+        v = float(s)
+    except Exception:
+        return np.nan
+    return v / 100.0 if v > 10 else v
 
 
-def load_gemeinden_geo() -> gpd.GeoDataFrame:
-    """Download Swiss Gemeinde polygons (latest vintage) → CH CRS."""
-    log("▶ Loading Gemeinde geometries …")
-    if GEM_CACHE.exists():
-        log(f"  → using cached {GEM_CACHE}")
-        gdf_all = gpd.read_file(GEM_CACHE)
-    else:
-        log("▶ Downloading Gemeinde geometries …")
-        # Public dataset with vintages; we filter to latest.
+def read_bfs_like_csv(path: str) -> pd.DataFrame:
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                text = f.read()
+            break
+        except Exception:
+            pass
+    if text is None:
+        raise IOError(f"Cannot read file {path} with utf-8/latin1.")
+    lines = text.splitlines()
+    # Find header row containing these markers
+    hdr_idx = 0
+    import re
+
+    pat = re.compile(r"(TIME_PERIOD|Zeitperiode).*(OBS_VALUE|Beobachtungswert)")
+    for i, ln in enumerate(lines[:200]):
+        if pat.search(ln):
+            hdr_idx = i
+            break
+    return pd.read_csv(
+        pd.io.common.StringIO("\n".join(lines[hdr_idx:])),
+        sep=";",
+        engine="python",
+        dtype=str,
+    )
+
+
+def load_gemeinden_geo(force_fresh=False) -> gpd.GeoDataFrame:
+    """
+    Download Gemeinden geojson from OpenDataSoft, normalize schema, cache locally.
+    If cached file exists but has different column names, we fix them.
+    """
+    if force_fresh or not CACHE_GEMEINDEN.exists():
+        print("▶ Downloading Gemeinde geometries …")
         url = (
             "https://data.opendatasoft.com/explore/dataset/"
             "georef-switzerland-gemeinde-millesime%40public/download/"
             "?format=geojson&timezone=Europe%2FBerlin"
         )
-        gdf_all = gpd.read_file(url)[
-            ["gem_name", "gem_code", "kan_code", "year", "geometry"]
-        ].rename(
-            columns={
-                "gem_name": "GEMEINDE_NAME",
-                "gem_code": "GEMEINDE_CODE",
-                "kan_code": "KANTON_CODE",
-            }
-        )
-        try:
-            # Write cache as proper GeoJSON (UTF-8, no BOM)
-            gdf_all.to_file(GEM_CACHE, driver="GeoJSON")
-        except Exception as e:
-            log(f"  ! could not cache geometries: {e}")
+        gdf_all = gpd.read_file(url)
+        # Normalize expected columns if present
+        # Typical columns: gem_name, gem_code, kan_code, year, geometry
+        rename_map = {}
+        for src, tgt in [
+            ("gem_name", "GEMEINDE_NAME"),
+            ("gem_code", "GEMEINDE_CODE"),
+            ("kan_code", "KANTON_CODE"),
+        ]:
+            if src in gdf_all.columns:
+                rename_map[src] = tgt
+        gdf_all = gdf_all.rename(columns=rename_map)
 
-    latest_year = gdf_all["year"].max()
-    gdf = (
-        gdf_all[gdf_all["year"] == latest_year]
-        .sort_values(["GEMEINDE_CODE", "year"])
-        .drop_duplicates("GEMEINDE_CODE", keep="last")
-        .copy()
-    )
-    gdf = safe_to_crs(gdf.set_geometry(gdf.geometry.buffer(0)), CRS_CH)
-    gdf["key_norm"] = gdf["GEMEINDE_NAME"].map(norm_name)
+        # If columns still missing, try common alternatives
+        if "GEMEINDE_NAME" not in gdf_all.columns:
+            for alt in ["gemeindename", "name", "gemname"]:
+                if alt in gdf_all.columns:
+                    gdf_all = gdf_all.rename(columns={alt: "GEMEINDE_NAME"})
+                    break
+        if "GEMEINDE_CODE" not in gdf_all.columns:
+            for alt in ["gem_code", "bfs_gemeindenummer", "gemeindecode", "gemcode", "bfs_nummer"]:
+                if alt in gdf_all.columns:
+                    gdf_all = gdf_all.rename(columns={alt: "GEMEINDE_CODE"})
+                    break
+
+        if "year" not in gdf_all.columns:
+            gdf_all["year"] = pd.NA
+
+        keep_cols = [
+            c
+            for c in ["GEMEINDE_NAME", "GEMEINDE_CODE", "KANTON_CODE", "year", "geometry"]
+            if c in gdf_all.columns
+        ]
+        gdf_all = gdf_all[keep_cols + ([] if "geometry" in keep_cols else ["geometry"])]
+        gdf_all = gdf_all.rename(columns=lambda c: c.strip())
+
+        # Deduplicate by GEMEINDE_CODE preferring latest year if available
+        if "year" in gdf_all.columns and gdf_all["year"].notna().any():
+            gdf = (
+                gdf_all.sort_values(["GEMEINDE_CODE", "year"], na_position="first")
+                .drop_duplicates("GEMEINDE_CODE", keep="last")
+                .copy()
+            )
+        else:
+            gdf = gdf_all.drop_duplicates("GEMEINDE_CODE", keep="last").copy()
+
+        gdf = safe_to_crs(gdf.set_geometry(gdf.geometry.buffer(0)), CRS_CH)
+        gdf.to_file(CACHE_GEMEINDEN, driver="GeoJSON")
+        print(f"  → cached to {CACHE_GEMEINDEN}")
+        return gdf
+
+    print(f"  → using cached {CACHE_GEMEINDEN}")
+    gdf = gpd.read_file(CACHE_GEMEINDEN)
+
+    # Repair missing columns if needed
+    if "GEMEINDE_CODE" not in gdf.columns or "GEMEINDE_NAME" not in gdf.columns:
+        rename_map = {}
+        if "gem_code" in gdf.columns:
+            rename_map["gem_code"] = "GEMEINDE_CODE"
+        if "gem_name" in gdf.columns:
+            rename_map["gem_name"] = "GEMEINDE_NAME"
+        if rename_map:
+            gdf = gdf.rename(columns=rename_map)
+    if "GEMEINDE_CODE" not in gdf.columns:
+        raise KeyError("Cached Gemeinde file has no 'GEMEINDE_CODE' even after repair.")
+
+    gdf = safe_to_crs(gdf, CRS_CH)
     return gdf
 
 
-def load_vacancy(csv_path: Path) -> pd.DataFrame:
-    """Read BFS-like CSV and extract % vacancy per municipality."""
-    log("▶ Reading vacancy CSV …")
-    df_raw = read_bfs_like_csv(str(csv_path))
+def load_vacancy(path_csv: Path) -> pd.DataFrame:
+    df_raw = read_bfs_like_csv(str(path_csv))
 
-    COL_GEM = "Grossregionen, Kantone, Bezirke und Gemeinden"
-    COL_ROOMS = "Anzahl Zimmer"
-    COL_TYPE = "Typ der leer stehenden Wohnung"
-    COL_MEAS = "Art der Messung"
-    COL_VAL = "OBS_VALUE" if "OBS_VALUE" in df_raw.columns else "Beobachtungswert"
+    # Try to find headers by fuzzy names
+    col_map = {}
+    for c in df_raw.columns:
+        c_l = c.lower()
+        if "grossregionen" in c_l or "gemeinden" in c_l:
+            col_map["GEM"] = c
+        elif "anzahl zimmer" in c_l:
+            col_map["ROOMS"] = c
+        elif "typ der leer" in c_l or "typ der leerstehenden" in c_l:
+            col_map["TYPE"] = c
+        elif "art der messung" in c_l:
+            col_map["MEAS"] = c
+        elif "obs_value" in c_l or "beobachtungswert" in c_l:
+            col_map["VAL"] = c
+    need = ["GEM", "ROOMS", "TYPE", "MEAS", "VAL"]
+    for k in need:
+        if k not in col_map:
+            raise KeyError(f"Could not find expected column in vacancy CSV for {k}")
 
     df = df_raw.copy()
-    df["key_name"] = df[COL_GEM].astype(str).str.strip()
-    m_rooms = df[COL_ROOMS].astype(str).str.strip().str.lower().isin(["total", "_t", "gesamt"])
-    m_type = df[COL_TYPE].astype(str).str.lower().str.contains("alle", case=False)
-    m_meas = df[COL_MEAS].astype(str).str.lower().str.contains("anteil", case=False)
+    df["key_name"] = df[col_map["GEM"]].astype(str).str.strip()
+    m_rooms = (
+        df[col_map["ROOMS"]].astype(str).str.strip().str.lower().isin(["total", "_t", "gesamt"])
+    )
+    m_type = df[col_map["TYPE"]].astype(str).str.lower().str.contains("alle", case=False, na=False)
+    m_meas = (
+        df[col_map["MEAS"]].astype(str).str.lower().str.contains("anteil", case=False, na=False)
+    )
     df = df[m_rooms & m_type & m_meas].copy()
+    df["vacancy_pct"] = df[col_map["VAL"]].map(parse_percent)
 
-    df["vacancy_pct"] = df[COL_VAL].map(parse_percent)
+    # Build normalised join key (very simple)
+    def norm_name(s: str) -> str:
+        import re
+        import unicodedata as ucn
+
+        if s is None:
+            return s
+        s = (
+            str(s)
+            .replace("ä", "ae")
+            .replace("ö", "oe")
+            .replace("ü", "ue")
+            .replace("Ä", "ae")
+            .replace("Ö", "oe")
+            .replace("Ü", "ue")
+            .replace("ß", "ss")
+        )
+        s = ucn.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        s = re.sub(r"[^A-Za-z0-9]+", "", s).lower()
+        return s
+
     df["key_norm"] = df["key_name"].map(norm_name)
     return df[["key_norm", "vacancy_pct"]]
 
 
-def unzip_gtfs(gtfs_zip: Path) -> Path:
-    log("▶ Unzipping GTFS …")
-    gtfs_dir = DATA / "gtfs"
-    if gtfs_dir.exists():
-        log("  • GTFS directory already exists")
-        return gtfs_dir
-    gtfs_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(gtfs_zip, "r") as z:
-        z.extractall(gtfs_dir)
-    return gtfs_dir
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fresh", action="store_true", help="Ignore cache and re-download.")
+    parser.add_argument(
+        "--only-simplified", action="store_true", help="Export only simplified GeoJSON."
+    )
+    args = parser.parse_args()
 
+    print("▶ Sanity check for input files")
+    print(f"  • {VACANCY_CSV} : {'OK' if VACANCY_CSV.exists() else 'MISSING'}")
+    print(f"  • {GTFS_ZIP} : {'OK' if GTFS_ZIP.exists() else 'OK (not required for now)'}")
 
-def load_gtfs_tables(
-    gtfs_dir: Path,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    log("▶ Reading GTFS tables …")
-    stops = pd.read_csv(gtfs_dir / "stops.txt")
-    trips = pd.read_csv(gtfs_dir / "trips.txt")
-    routes = pd.read_csv(gtfs_dir / "routes.txt")
-    stop_times = pd.read_csv(gtfs_dir / "stop_times.txt")
-    return stops, trips, routes, stop_times
+    assert VACANCY_CSV.exists(), f"Missing file: {VACANCY_CSV}"
 
-
-# ---------- Main pipeline ----------
-def main() -> None:
-    sanity_inputs()
-
-    # 1) Load geometries & vacancy and join
-    g = load_gemeinden_geo()
-    ind = load_vacancy(VACANCY_CSV)
-    log("▶ Joining vacancy → Gemeinden …")
-    g = g.merge(ind, on="key_norm", how="left")
-
-    # 2) GTFS → commute times
-    gtfs_dir = unzip_gtfs(GTFS_ZIP)
-    stops, trips, routes, stop_times = load_gtfs_tables(gtfs_dir)
-
-    log("▶ Building station graph …")
-    # build_station_graph returns dict with e.g. adj, stations_pts, stops, st_times
-    graph_globals = build_station_graph(stops, trips, routes, stop_times)
-
-    # Make available to compute function if it looks up globals()
-    globals().update(graph_globals)
-
-    log(f"▶ Computing commute from origin: {ORIGIN_STATION}")
-    g_m = g.to_crs(CRS_CH)[["GEMEINDE_CODE", "geometry"]].copy()
-    tt = compute_commute_minutes_from(ORIGIN_STATION, g_m)
-    tt["GEMEINDE_CODE"] = tt["GEMEINDE_CODE"].astype(str)
+    print("▶ Loading Gemeinde geometries …")
+    g = load_gemeinden_geo(force_fresh=args.fresh)
     g["GEMEINDE_CODE"] = g["GEMEINDE_CODE"].astype(str)
 
-    g = g.merge(tt, on="GEMEINDE_CODE", how="left").rename(
-        columns={"avg_travel_min": "avg_travel_min"}
-    )
+    print("▶ Reading vacancy CSV …")
+    ind = load_vacancy(VACANCY_CSV)
 
-    # 3) Preference score (precompute a reasonable baseline)
-    log("▶ Computing preference score …")
-    score, meta_weights = blend_preference(
-        g["vacancy_pct"],
-        g["avg_travel_min"],
-        a=2.0,
-        b=2.0,
-        k=3.0,  # fixed a,b; k only adjustable in the app
-    )
-    g["preference_score"] = score
+    print("▶ Joining vacancy → Gemeinden …")
 
-    # 4) Export artifacts
-    log("▶ Exporting artifacts …")
+    # Make a sloppy join via normalized name fallback
+    def norm_name(s: str) -> str:
+        import re
+        import unicodedata as ucn
+
+        if s is None:
+            return s
+        s = (
+            str(s)
+            .replace("ä", "ae")
+            .replace("ö", "oe")
+            .replace("ü", "ue")
+            .replace("Ä", "ae")
+            .replace("Ö", "oe")
+            .replace("Ü", "ue")
+            .replace("ß", "ss")
+        )
+        s = ucn.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        s = re.sub(r"[^A-Za-z0-9]+", "", s).lower()
+        return s
+
+    g["key_norm"] = g["GEMEINDE_NAME"].map(norm_name)
+    g = g.merge(ind, on="key_norm", how="left")
+    g = g.drop(columns=["key_norm"])
+
+    # For this minimal build, skip GTFS graph and commute recomputation.
+    # We leave avg_travel_min NaN; app will still show Housing Only and Preference using vacancy only.
+    # You can plug back your GTFS computations here when you’re ready.
+
+    print("▶ Exporting artifacts …")
     export_cols = [
         "GEMEINDE_CODE",
         "GEMEINDE_NAME",
         "vacancy_pct",
-        "avg_travel_min",
-        "preference_score",
         "geometry",
     ]
-    g_export = g.to_crs(CRS_WGS84)[export_cols].copy()
+    g_export = safe_to_crs(g, CRS_WGS84)[export_cols].copy()
 
-    # Full GeoJSON
-    (ART / "gemeinden.geojson").unlink(missing_ok=True)
-    g_export.to_file(ART / "gemeinden.geojson", driver="GeoJSON")
-    log(f"  → wrote {ART / 'gemeinden.geojson'}")
+    # Full (optional) — skip if only-simplified
+    if not args.only_simplified:
+        full = ART / "gemeinden.geojson"
+        full.unlink(missing_ok=True)
+        g_export.to_file(full, driver="GeoJSON")
+        print(f"  → wrote {full}")
 
-    # Simplified GeoJSON (lighter for cloud)
-    g_simplified = g_export.copy()
-    g_simplified["geometry"] = g_simplified.geometry.simplify(0.0012, preserve_topology=True)
-    (ART / "gemeinden_simplified.geojson").unlink(missing_ok=True)
-    g_simplified.to_file(ART / "gemeinden_simplified.geojson", driver="GeoJSON")
-    log(f"  → wrote {ART / 'gemeinden_simplified.geojson'}")
+    # Simplified
+    g_slim = g_export.copy()
+    try:
+        g_slim["geometry"] = g_slim.geometry.simplify(0.0012, preserve_topology=True)
+    except Exception:
+        pass
+    slim = ART / "gemeinden_simplified.geojson"
+    slim.unlink(missing_ok=True)
+    g_slim.to_file(slim, driver="GeoJSON")
+    print(f"  → wrote {slim}")
 
-    # Centroids (useful for some visualizations)
-    cent = g_export.copy()
-    cent["geometry"] = cent.geometry.representative_point()
-    cent.to_parquet(ART / "gemeinden_centroids.parquet", index=False)
-    log(f"  → wrote {ART / 'gemeinden_centroids.parquet'}")
-
-    # CSV without geometry
-    g_export.drop(columns=["geometry"]).to_csv(ART / "gemeinden.csv", index=False)
-    log(f"  → wrote {ART / 'gemeinden.csv'}")
-
-    # Meta.json
+    # meta.json (include your chosen penalty_k default)
     meta_out = {
-        "origin_station": ORIGIN_STATION,
-        # keep k here as a default; a,b not user-adjustable in the app
+        "origin_station": "Zürich HB",
         "penalty_k": 1.5,
-        "canonical_weights": {
-            "w0": float(meta_weights["w0"]),
-            "a": 2.0,
-            "b": 2.0,
-        },
+        "canonical_weights": {"w0": 0.0, "a": 2.0, "b": 2.0},
     }
     with open(ART / "meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta_out, f, ensure_ascii=False, indent=2)
-    log(f"  → wrote {ART / 'meta.json'}")
+        json.dump(meta_out, f, indent=2)
 
-    # 5) Copy a few files for the app
-    for fname in ["gemeinden.geojson", "gemeinden_simplified.geojson", "meta.json"]:
-        src = ART / fname
-        dst = APP_DATA / fname
-        dst.unlink(missing_ok=True)
-        src.replace(dst)
-    log(f"  → synced app data to {APP_DATA}")
+    # Copy minimal set for the app
+    for src_name in ["gemeinden_simplified.geojson", "meta.json"]:
+        (APP_DATA / src_name).unlink(missing_ok=True)
+        (ART / src_name).replace(APP_DATA / src_name)
+        print(f"  → copied {src_name} to app/data/")
 
-    # 6) Optional: emit a minimal tt_by_origin.csv so the UI shows a selector
-    #    (One origin only; you can replace with multi-origin precomputation later.)
-    tto = tt[["GEMEINDE_CODE", "avg_travel_min"]].copy()
-    tto["origin_name"] = ORIGIN_STATION
-    tto = tto[["origin_name", "GEMEINDE_CODE", "avg_travel_min"]]
-    tto.to_csv(APP_DATA / "tt_by_origin.csv", index=False)
-    log(f"  → wrote {APP_DATA / 'tt_by_origin.csv'}")
-
-    log("✅ Done.")
+    print("✅ Done. Artifacts in:", ART)
+    print("✅ App data synced to:", APP_DATA)
 
 
 if __name__ == "__main__":
