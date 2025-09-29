@@ -1,8 +1,6 @@
-# --- Default behavior ---
-# Normalize to LF in the repo, checkout CRLF on Windows if needed
 * text=auto
 
-# --- Force LF for code & text files ---
+# Force LF for code & text
 *.py    text eol=lf
 *.ipynb text eol=lf
 *.md    text eol=lf
@@ -15,14 +13,14 @@
 *.cfg   text eol=lf
 *.sh    text eol=lf
 
-# --- Windows batch scripts keep CRLF ---
+# Windows batch scripts keep CRLF
 *.bat   text eol=crlf
 
-# --- Binary files (no line-ending conversion, no diff) ---
+# Binary artifacts (no line ending conversion, and **no LFS**)
 *.parquet -text
 *.geojson -text
-*.png     -text
-*.jpg     -text
-*.jpeg    -text
-*.zip     -text
-*.pkl     -text
+*.png  -text
+*.jpg  -text
+*.jpeg -text
+*.zip  -text
+*.pkl  -text
