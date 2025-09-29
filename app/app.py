@@ -11,11 +11,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- App-wide cache buster ----------
-# Bump this string any time you want Streamlit Cloud to invalidate cached data.
-CACHE_VERSION = "v2"
-
-# ---------- Setup ----------
 try:
     BASE_DIR = Path(__file__).resolve().parent
 except NameError:
@@ -24,8 +19,9 @@ DATA_DIR = BASE_DIR / "data"
 
 st.set_page_config(page_title="Swiss Housing & Commute Explorer", layout="wide")
 
+# ---------------- Utils ----------------
 
-# ---------- Utils ----------
+
 def robust_range(series_like, lo_q=1, hi_q=99):
     s = pd.to_numeric(pd.Series(series_like).astype("float64"), errors="coerce")
     s = s[np.isfinite(s)]
@@ -41,7 +37,7 @@ def robust_range(series_like, lo_q=1, hi_q=99):
 
 
 def norm01_clipped(x, lo, hi):
-    x = np.asarray(x, dtype="float64")
+    x = np.asarray(pd.to_numeric(x, errors="coerce"), dtype="float64")
     lo, hi = float(lo), float(hi)
     if hi <= lo + 1e-9:
         return np.zeros_like(x)
@@ -58,65 +54,30 @@ def commute_penalty_shape(t_norm, k):
 def enforce_origin_zero_and_shift(
     df_wgs84: gpd.GeoDataFrame, tt_sel: pd.DataFrame | None
 ) -> gpd.GeoDataFrame:
-    """
-    Apply origin-specific travel times if provided; otherwise fall back safely.
-
-    Ensures columns exist and handles the case where the GeoJSON has no
-    'avg_travel_min' at all (e.g., simplified artifacts). In that case we keep
-    avg_travel_min_eff as NaN unless tt_sel provides values.
-    """
     df = df_wgs84.copy()
-
-    # Always normalize types and ensure base column exists
     df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
     if "avg_travel_min" not in df.columns:
         df["avg_travel_min"] = np.nan
-
-    # Start with the base column as the effective one
     df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
-
-    # If we have origin-specific times, left-merge and prefer those (no combine_first)
     if tt_sel is not None and not tt_sel.empty:
         tmp = tt_sel[["GEMEINDE_CODE", "avg_travel_min"]].copy()
         tmp["GEMEINDE_CODE"] = tmp["GEMEINDE_CODE"].astype(str)
         tmp = tmp.rename(columns={"avg_travel_min": "avg_travel_min_origin"})
         df = df.merge(tmp, on="GEMEINDE_CODE", how="left")
-
+        # prefer origin-specific where available
         origin_vals = pd.to_numeric(df["avg_travel_min_origin"], errors="coerce")
         base_vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
-        df["avg_travel_min_eff"] = np.where(origin_vals.notna(), origin_vals, base_vals)
+        df["avg_travel_min_eff"] = np.where(np.isfinite(origin_vals), origin_vals, base_vals)
 
-    # Shift so the best (minimum) becomes 0, if we have any finite values
     cur = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
     if np.isfinite(cur).any():
         mmin = float(np.nanmin(cur))
         df.loc[cur == mmin, "avg_travel_min_eff"] = 0.0
         df.loc[cur != mmin, "avg_travel_min_eff"] = (cur - mmin)[cur != mmin]
-
-    # Final sanitation
     df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").clip(
         lower=0
     )
     return df
-
-
-def resolve_prior(meta, session):
-    if "manual_weights" in session:
-        mw = session["manual_weights"]
-        return (
-            float(mw.get("w0", 0.0)),
-            float(max(0.0, mw.get("w_v", 2.0))),
-            float(max(0.0, mw.get("w_t", 2.0))),
-        )
-    try:
-        cw = meta["canonical_weights"]
-        return (
-            float(cw.get("w0", 0.0)),
-            float(max(0.0, cw.get("a", 2.0))),
-            float(max(0.0, cw.get("b", 2.0))),
-        )
-    except Exception:
-        return (0.0, 2.0, 2.0)
 
 
 def answers_signature(choices_dict):
@@ -125,7 +86,6 @@ def answers_signature(choices_dict):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-# ---------- Robust GeoJSON loader (handles LFS pointers / HTML) ----------
 def _looks_like_lfs_pointer(text_head: str) -> bool:
     head = (text_head or "").strip().lower()
     return head.startswith("version https://git-lfs.github.com/spec/v1")
@@ -140,95 +100,64 @@ def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"GeoJSON not found: {p}")
-
-    # 1) Try pyogrio (default in geopandas)
+    # fast path
     try:
         return gpd.read_file(str(p))
     except Exception:
         pass
-
-    # 2) Try fiona explicitly
     try:
         return gpd.read_file(str(p), engine="fiona")
     except Exception:
         pass
-
-    # 3) Manual JSON parse with sanity checks
     raw = p.read_bytes()
     if len(raw) < 50:
         raise ValueError(f"GeoJSON looks empty or truncated: {p} (size={len(raw)} bytes)")
-
     head = raw[:200].decode("utf-8", errors="ignore")
     if _looks_like_lfs_pointer(head):
-        raise ValueError(
-            f"File appears to be a Git LFS pointer, not actual GeoJSON: {p}.\n"
-            f"Fix: untrack with Git LFS or ensure Streamlit Cloud fetches LFS objects."
-        )
+        raise ValueError(f"File appears to be a Git LFS pointer, not actual GeoJSON: {p}.")
     if _looks_like_html(head):
-        raise ValueError(
-            f"File looks like HTML, not GeoJSON: {p}.\n"
-            f"Likely a GitHub 'too large to display' page or accidental HTML content."
-        )
-
+        raise ValueError(f"File looks like HTML, not GeoJSON: {p}.")
+    gj = None
     try:
         gj = json.loads(raw.decode("utf-8", errors="strict"))
-    except Exception as e:
-        gj = None
+    except Exception:
         for enc in ("utf-8-sig", "latin-1"):
             try:
                 gj = json.loads(raw.decode(enc))
                 break
             except Exception:
                 pass
-        if gj is None:
-            raise ValueError(f"Could not parse GeoJSON as JSON: {p}. Error: {e}")
-
     if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection":
         raise ValueError(f"Not a FeatureCollection: {p}")
-
     feats = gj.get("features", [])
     if not feats:
         raise ValueError(f"FeatureCollection has no features: {p}")
-
-    try:
-        return gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326")
-    except Exception as e:
-        raise ValueError(f"Could not build GeoDataFrame from features: {p}. Error: {e}")
+    return gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326")
 
 
 @st.cache_data(show_spinner=False)
-def load_data(_cache_buster: str):
-    # Prefer smaller/simplified file first for cloud robustness
+def load_data():
     simplified = DATA_DIR / "gemeinden_simplified.geojson"
-    full = DATA_DIR / "gemeinden.geojson"
     meta_path = DATA_DIR / "meta.json"
-
     if not meta_path.exists():
         st.error("Artifacts not found. Re-run the export/build step.")
         st.stop()
-
-    # Read meta with encoding safety
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         meta = json.loads(codecs.open(meta_path, "r", "utf-8-sig").read())
 
-    g = None
     errors = []
-    for candidate in [simplified, full]:
+    g = None
+    for candidate in [simplified]:
         if candidate.exists():
             try:
                 g = read_geojson_robust(candidate)
                 break
             except Exception as e:
                 errors.append(f"{candidate.name}: {e}")
-
     if g is None:
-        st.error(
-            "Unable to load GeoJSON artifacts.\n\n"
-            + "\n".join(f"- {msg}" for msg in errors)
-            + "\n\nFix on repo: ensure real GeoJSON is committed (not an LFS pointer or HTML)."
-        )
+        st.error("Unable to load GeoJSON artifacts.\n\n" + "\n".join(f"- {m}" for m in errors))
         st.stop()
 
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
@@ -238,7 +167,7 @@ def load_data(_cache_buster: str):
         if c in g.columns:
             g[c] = pd.to_numeric(g[c], errors="coerce")
 
-    # Try Parquet for dynamic origins; fallback to CSV
+    # dynamic origins
     tto = None
     for f in [DATA_DIR / "tt_by_origin.parquet", DATA_DIR / "tt_by_origin.csv"]:
         if f.exists():
@@ -247,7 +176,6 @@ def load_data(_cache_buster: str):
                 break
             except Exception:
                 continue
-
     if tto is not None:
         if "GEMEINDE_CODE" in tto.columns:
             tto["GEMEINDE_CODE"] = tto["GEMEINDE_CODE"].astype(str)
@@ -259,8 +187,9 @@ def load_data(_cache_buster: str):
     return g, meta, tto
 
 
-# ---------- App ----------
-g, meta, tt_by_origin = load_data(CACHE_VERSION)
+# ---------------- App ----------------
+
+g, meta, tt_by_origin = load_data()
 
 st.title("Swiss Housing & Commute Explorer")
 st.markdown(
@@ -269,14 +198,8 @@ st.markdown(
     "Pick the **origin station** in the left sidebar."
 )
 
-# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Controls")
-
-    # Clear-cache button for Cloud debugging
-    if st.button("♻️ Clear cache & rerun"):
-        st.cache_data.clear()
-        st.rerun()
 
     def _is_bahn2000(name: str) -> bool:
         s = str(name).lower()
@@ -306,50 +229,48 @@ with st.sidebar:
         help="Adjusts the curvature used in Preference score.",
     )
 
-# ---------- Effective commute times ----------
 df = g.copy()
 df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
 
 if (
     tt_by_origin is not None
-    and origin_name in tt_by_origin.get("origin_name", pd.Series(dtype=str)).astype(str).unique()
+    and "origin_name" in tt_by_origin.columns
+    and origin_name in tt_by_origin["origin_name"].astype(str).unique()
 ):
     tt_sel = tt_by_origin.loc[
-        tt_by_origin["origin_name"] == origin_name, ["GEMEINDE_CODE", "avg_travel_min"]
+        tt_by_origin["origin_name"].astype(str).eq(origin_name),
+        ["GEMEINDE_CODE", "avg_travel_min"],
     ].copy()
 else:
     tt_sel = None
 
 df = enforce_origin_zero_and_shift(df, tt_sel)
 
-# Simplify for speed (safe no-op if already simple)
+# simplify (in case)
 try:
     df["geometry"] = df.geometry.simplify(0.0005, preserve_topology=True)
 except Exception:
     pass
 
-# ---------- Ranges ----------
-v_range = robust_range(df["vacancy_pct"])
-t_range = robust_range(df["avg_travel_min_eff"])
+v_range = robust_range(df.get("vacancy_pct", np.nan))
+t_range = robust_range(df.get("avg_travel_min_eff", np.nan))
 
 
-# ---------- Scenario scaffolding (edge-case tradeoffs) ----------
-def build_edge_tradeoffs(
-    _df, v_range, t_range, n=10, seed=42, dtnorm_range=(0.05, 0.18), dvnorm_range=(0.10, 0.30)
-):
+# ---- Preference elicitation scenarios ----
+def build_edge_tradeoffs(_df, v_range, t_range, n=10, seed=42):
     if isinstance(_df, (pd.DataFrame, gpd.GeoDataFrame)):
-        df = _df.copy()
+        dfx = _df.copy()
     else:
-        df = pd.DataFrame(_df)
+        dfx = pd.DataFrame(_df)
     need = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"]
     for c in need:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[need].copy()
-    df["vacancy_pct"] = pd.to_numeric(df["vacancy_pct"], errors="coerce")
-    df["avg_travel_min"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
-    df = df.dropna(subset=["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"])
-    if df.empty:
+        if c not in dfx.columns:
+            dfx[c] = np.nan
+    dfx = dfx[need].copy()
+    dfx["vacancy_pct"] = pd.to_numeric(dfx["vacancy_pct"], errors="coerce")
+    dfx["avg_travel_min"] = pd.to_numeric(dfx["avg_travel_min"], errors="coerce")
+    dfx = dfx.dropna(subset=["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"])
+    if dfx.empty:
         return pd.DataFrame(
             columns=[
                 "qid",
@@ -361,35 +282,37 @@ def build_edge_tradeoffs(
                 "B_travel_min",
             ]
         )
+
     v_lo, v_hi = v_range
     t_lo, t_hi = t_range
-    df["v_n"] = norm01_clipped(df["vacancy_pct"].values, v_lo, v_hi)
-    df["t_n"] = norm01_clipped(df["avg_travel_min"].values, t_lo, t_hi)
+    dfx["v_n"] = norm01_clipped(dfx["vacancy_pct"].values, v_lo, v_hi)
+    dfx["t_n"] = norm01_clipped(dfx["avg_travel_min"].values, t_lo, t_hi)
     rng = np.random.default_rng(seed)
     used = set()
     rows = []
     tries = 0
+
     while len(rows) < n and tries < 8000:
         tries += 1
-        A = df.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
+        A = dfx.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
         if A["GEMEINDE_NAME"] in used:
             continue
         orientation = int(rng.integers(0, 2))
         if orientation == 0:
-            cand = df[
-                (df["v_n"] < A["v_n"])
-                & (df["t_n"] < A["t_n"])
-                & ((A["v_n"] - df["v_n"]).between(0.10, 0.30, inclusive="both"))
-                & ((A["t_n"] - df["t_n"]).between(0.05, 0.18, inclusive="both"))
-                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
+            cand = dfx[
+                (dfx["v_n"] < A["v_n"])
+                & (dfx["t_n"] < A["t_n"])
+                & ((A["v_n"] - dfx["v_n"]).between(0.10, 0.30, inclusive="both"))
+                & ((A["t_n"] - dfx["t_n"]).between(0.05, 0.18, inclusive="both"))
+                & (~dfx["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
             ]
         else:
-            cand = df[
-                (df["v_n"] > A["v_n"])
-                & (df["t_n"] > A["t_n"])
-                & ((df["v_n"] - A["v_n"]).between(0.10, 0.30, inclusive="both"))
-                & ((df["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both"))
-                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
+            cand = dfx[
+                (dfx["v_n"] > A["v_n"])
+                & (dfx["t_n"] > A["t_n"])
+                & ((dfx["v_n"] - A["v_n"]).between(0.10, 0.30, inclusive="both"))
+                & ((dfx["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both"))
+                & (~dfx["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
             ]
         if cand.empty:
             continue
@@ -416,7 +339,6 @@ sc = build_edge_tradeoffs(df_scen, v_range=v_range, t_range=t_range, n=10, seed=
 
 tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map", "🧭 Preference elicitation", "📄 Data"])
 
-# ---------- Preference elicitation ----------
 with tab_pref:
     st.subheader("10 trade-off questions")
     if sc.empty:
@@ -466,7 +388,6 @@ if answered_rows and st.session_state.get("answers_sig") != ans_sig:
     }
     st.session_state["answers_sig"] = ans_sig
 
-# ---------- Data preview ----------
 with tab_data:
     show = df.copy()
     show["avg_travel_min_eff"] = pd.to_numeric(show["avg_travel_min_eff"], errors="coerce")
@@ -474,11 +395,10 @@ with tab_data:
     cols = [c for c in cols if c in show.columns]
     st.dataframe(
         show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
-        width="stretch",  # replaces deprecated use_container_width
+        width="stretch",
     )
     st.caption(f"Total rows: {len(show)}")
 
-# ---------- Map ----------
 with tab_map:
     if map_mode == "Housing only":
         metric_col = "vacancy_pct"
@@ -514,7 +434,7 @@ with tab_map:
                 st.session_state["manual_weights"].get("t_max", t_range[1])
             )
         else:
-            w0, a, b = resolve_prior(meta, st.session_state)
+            w0, a, b = 0.0, 2.0, 2.0
             v_lo, v_hi = v_range
             t_lo, t_hi = t_range
 
@@ -524,11 +444,9 @@ with tab_map:
         )
         pen_t = commute_penalty_shape(t_all, penalty_k)
         util = w0 + a * v_all - b * pen_t
-
         finite = np.isfinite(util)
         if finite.any():
             util = util - np.median(util[finite])
-
         df_render = df.copy()
         df_render["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
         vmin, vmax = 0.0, 100.0

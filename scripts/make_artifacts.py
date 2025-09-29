@@ -1,542 +1,386 @@
-# app/app.py
+# scripts/make_artifacts.py
 # -*- coding: utf-8 -*-
 
-import codecs
-import hashlib
+from __future__ import annotations
+
+import argparse
 import json
+import math
+import os
 from pathlib import Path
+from typing import Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import streamlit as st
+from shapely.geometry import Point
 
-try:
-    BASE_DIR = Path(__file__).resolve().parent
-except NameError:
-    BASE_DIR = Path.cwd()
-DATA_DIR = BASE_DIR / "data"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+DATA = ROOT / "data"
+APP_DATA = ROOT / "app" / "data"
+ARTIFACTS = DATA / "artifacts"
 
-st.set_page_config(page_title="Swiss Housing & Commute Explorer", layout="wide")
+VACANCY_CSV = DATA / "vacancy_municipality.csv"
+GEMEINDEN_CACHE = DATA / "gemeinden_cache.geojson"
 
-
-# ---------- Utils ----------
-def robust_range(series_like, lo_q=1, hi_q=99):
-    s = pd.to_numeric(pd.Series(series_like).astype("float64"), errors="coerce")
-    s = s[np.isfinite(s)]
-    if s.empty:
-        return (0.0, 1.0)
-    lo = float(np.nanpercentile(s, lo_q))
-    hi = float(np.nanpercentile(s, hi_q))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = float(np.nanmin(s)), float(np.nanmax(s))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = 0.0, 1.0
-    return lo, hi
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
 
-def norm01_clipped(x, lo, hi):
-    x = np.asarray(x, dtype="float64")
+def ensure_dirs():
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    APP_DATA.mkdir(parents=True, exist_ok=True)
+
+
+def robust_read_csv(path: Path) -> pd.DataFrame:
+    """Try default CSV; if a single mega-column, re-read as semicolon SDMX."""
+    df = pd.read_csv(path, engine="python")
+    if len(df.columns) == 1:
+        df = pd.read_csv(path, sep=";", engine="python")
+    return df
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance (km)."""
+    R = 6371.0
+    p = math.pi / 180.0
+    dlat = (lat2 - lat1) * p
+    dlon = (lon2 - lon1) * p
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def norm01(x, lo=None, hi=None):
+    x = np.asarray(pd.to_numeric(x, errors="coerce"), dtype="float64")
+    if lo is None or hi is None:
+        finite = x[np.isfinite(x)]
+        if finite.size == 0:
+            return np.zeros_like(x)
+        lo = float(np.nanpercentile(finite, 1))
+        hi = float(np.nanpercentile(finite, 99))
+        if hi <= lo:
+            lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+            if hi <= lo:
+                hi = lo + 1.0
     lo, hi = float(lo), float(hi)
-    if hi <= lo + 1e-9:
-        return np.zeros_like(x)
     x = np.clip(x, lo, hi)
-    return (x - lo) / (hi - lo)
+    return (x - lo) / (hi - lo + 1e-12)
 
 
-def commute_penalty_shape(t_norm, k):
+def commute_penalty(t_norm: np.ndarray, k: float) -> np.ndarray:
     t = np.clip(np.asarray(t_norm, dtype="float64"), 0.0, 1.0)
     kk = max(0.2, float(k))
     return 1.0 - np.power(1.0 - t, kk)
 
 
-def enforce_origin_zero_and_shift(
-    df_wgs84: gpd.GeoDataFrame, tt_sel: pd.DataFrame | None
-) -> gpd.GeoDataFrame:
-    df = df_wgs84.copy()
-    df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
-
-    # Ensure base columns exist
-    if "avg_travel_min" not in df.columns:
-        df["avg_travel_min"] = np.nan
-    df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
-
-    # If provided, prefer origin-specific
-    if tt_sel is not None and not tt_sel.empty:
-        tmp = tt_sel[["GEMEINDE_CODE", "avg_travel_min"]].copy()
-        tmp["GEMEINDE_CODE"] = tmp["GEMEINDE_CODE"].astype(str)
-        tmp = tmp.rename(columns={"avg_travel_min": "avg_travel_min_origin"})
-        df = df.merge(tmp, on="GEMEINDE_CODE", how="left")
-
-        origin_vals = pd.to_numeric(df["avg_travel_min_origin"], errors="coerce")
-        base_vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
-        df["avg_travel_min_eff"] = np.where(origin_vals.notna(), origin_vals, base_vals)
-
-    # Shift to min=0
-    cur = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
-    if np.isfinite(cur).any():
-        mmin = float(np.nanmin(cur))
-        df.loc[cur == mmin, "avg_travel_min_eff"] = 0.0
-        df.loc[cur != mmin, "avg_travel_min_eff"] = (cur - mmin)[cur != mmin]
-
-    df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").clip(
-        lower=0
-    )
-    return df
+# ------------------------------------------------------------
+# Load Gemeinde polygons
+# ------------------------------------------------------------
 
 
-def resolve_prior(meta, session):
-    if "manual_weights" in session:
-        mw = session["manual_weights"]
-        return (
-            float(mw.get("w0", 0.0)),
-            float(max(0.0, mw.get("w_v", 2.0))),
-            float(max(0.0, mw.get("w_t", 2.0))),
+def load_gemeinden_geo() -> gpd.GeoDataFrame:
+    """
+    Load Gemeinde polygons from local cache. If you need to (re)create this
+    cache from OGD, do it once locally and commit only the simplified artifact.
+    """
+    if not GEMEINDEN_CACHE.exists():
+        raise FileNotFoundError(
+            f"Missing {GEMEINDEN_CACHE}. Create it once locally (download OGD polygons) "
+            "or copy an existing cache into data/."
         )
-    try:
-        cw = meta["canonical_weights"]
-        return (
-            float(cw.get("w0", 0.0)),
-            float(max(0.0, cw.get("a", 2.0))),
-            float(max(0.0, cw.get("b", 2.0))),
-        )
-    except Exception:
-        return (0.0, 2.0, 2.0)
-
-
-def answers_signature(choices_dict):
-    key_order = sorted(choices_dict.keys())
-    s = "|".join(f"{k}:{choices_dict[k]}" for k in key_order)
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-# ---------- Robust GeoJSON loader ----------
-def _looks_like_lfs_pointer(text_head: str) -> bool:
-    head = (text_head or "").strip().lower()
-    return head.startswith("version https://git-lfs.github.com/spec/v1")
-
-
-def _looks_like_html(text_head: str) -> bool:
-    h = (text_head or "").lstrip().lower()
-    return h.startswith("<!doctype html") or h.startswith("<html")
-
-
-def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"GeoJSON not found: {p}")
-    try:
-        return gpd.read_file(str(p))
-    except Exception:
-        pass
-    try:
-        return gpd.read_file(str(p), engine="fiona")
-    except Exception:
-        pass
-
-    raw = p.read_bytes()
-    if len(raw) < 50:
-        raise ValueError(f"GeoJSON looks empty or truncated: {p} (size={len(raw)} bytes)")
-    head = raw[:200].decode("utf-8", errors="ignore")
-    if _looks_like_lfs_pointer(head):
-        raise ValueError(f"File appears to be a Git LFS pointer, not actual GeoJSON: {p}.")
-    if _looks_like_html(head):
-        raise ValueError(f"File looks like HTML, not GeoJSON: {p}.")
-    try:
-        gj = json.loads(raw.decode("utf-8", errors="strict"))
-    except Exception:
-        gj = None
-        for enc in ("utf-8-sig", "latin-1"):
-            try:
-                gj = json.loads(raw.decode(enc))
-                break
-            except Exception:
-                pass
-        if gj is None:
-            raise
-    if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection":
-        raise ValueError(f"Not a FeatureCollection: {p}")
-    feats = gj.get("features", [])
-    if not feats:
-        raise ValueError(f"FeatureCollection has no features: {p}")
-    return gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326")
-
-
-@st.cache_data(show_spinner=False)
-def load_data():
-    # Prefer simplified, which we now ship *with* all attributes
-    simplified = DATA_DIR / "gemeinden_simplified.geojson"
-    full = DATA_DIR / "gemeinden.geojson"
-    meta_path = DATA_DIR / "meta.json"
-
-    if not meta_path.exists():
-        st.error("Artifacts not found. Re-run the export/build step.")
-        st.stop()
-
-    # meta
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        meta = json.loads(codecs.open(meta_path, "r", "utf-8-sig").read())
-
-    g = None
-    for candidate in [simplified, full]:
-        if candidate.exists():
-            try:
-                g = read_geojson_robust(candidate)
-                break
-            except Exception:
-                continue
-
-    if g is None:
-        st.error("Unable to load GeoJSON artifacts.")
-        st.stop()
-
+    g = gpd.read_file(GEMEINDEN_CACHE)
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
 
-    # Normalize expected columns
+    # Try to normalize ID & name columns
+    # Common OGD schema: 'GEMEINDE_CODE' (BFS code), 'GEMEINDE_NAME'
+    candidates_id = [
+        "GEMEINDE_CODE",
+        "BFS",
+        "BFSNR",
+        "GMDNR",
+        "bfs",
+        "GR_KT_GDE",  # last resort (present in your vacancy CSV too)
+    ]
+    candidates_name = ["GEMEINDE_NAME", "NAME", "NAME_DE", "gemname"]
+
+    g_cols = {c.lower(): c for c in g.columns}
+    gid = next((g_cols[c.lower()] for c in candidates_id if c.lower() in g_cols), None)
+    gname = next((g_cols[c.lower()] for c in candidates_name if c.lower() in g_cols), None)
+
+    if gid is None:
+        raise KeyError(
+            "Could not find a Gemeinde code column in polygons. Expect one of "
+            f"{candidates_id}. Got: {list(g.columns)}"
+        )
+    if gname is None:
+        # not fatal; we can proceed without it
+        gname = gid
+
+    g = g.rename(columns={gid: "GEMEINDE_CODE", gname: "GEMEINDE_NAME"})
     g["GEMEINDE_CODE"] = g["GEMEINDE_CODE"].astype(str)
-    if "GEMEINDE_NAME" not in g.columns:
-        g["GEMEINDE_NAME"] = g.get("name", pd.Series(range(len(g)))).astype(str)
 
-    for c in ["vacancy_pct", "avg_travel_min", "preference_score"]:
-        if c in g.columns:
-            g[c] = pd.to_numeric(g[c], errors="coerce")
-
-    # Optional dynamic origins (small file produced by builder)
-    tto = None
-    pqt = DATA_DIR / "tt_by_origin.parquet"
-    csv = DATA_DIR / "tt_by_origin.csv"
-    for f in [pqt, csv]:
-        if f.exists():
-            try:
-                tto = pd.read_parquet(f) if f.suffix == ".parquet" else pd.read_csv(f)
-                break
-            except Exception:
-                continue
-    if tto is not None and "GEMEINDE_CODE" in tto.columns:
-        tto["GEMEINDE_CODE"] = tto["GEMEINDE_CODE"].astype(str)
-        if "avg_travel_min" in tto.columns:
-            tto["avg_travel_min"] = pd.to_numeric(tto["avg_travel_min"], errors="coerce")
-        if "origin_name" not in tto.columns and "origin_station_id" in tto.columns:
-            tto["origin_name"] = tto["origin_station_id"].astype(str)
-
-    return g, meta, tto
+    return g
 
 
-# ---------- App ----------
-g, meta, tt_by_origin = load_data()
-
-st.title("Swiss Housing & Commute Explorer")
-st.markdown(
-    "Explore Swiss municipalities by combining **housing vacancy** and **commute time**. "
-    "Three modes: **Preference score**, **Housing only**, **Commute only**. "
-    "Pick the **origin station** in the left sidebar."
-)
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Controls")
-
-    def _is_bahn2000(name: str) -> bool:
-        s = str(name).lower()
-        return ("bahn" in s) and ("2000" in s)
-
-    if (
-        tt_by_origin is not None
-        and "origin_name" in tt_by_origin.columns
-        and tt_by_origin["origin_name"].notna().any()
-    ):
-        stations_raw = tt_by_origin["origin_name"].dropna().astype(str).unique().tolist()
-        stations = sorted([s for s in stations_raw if not _is_bahn2000(s)], key=str.casefold)
-        default_origin = meta.get("origin_station", "Zürich HB")
-        idx = stations.index(default_origin) if default_origin in stations else 0
-        origin_name = st.selectbox("Origin SBB station", options=stations, index=idx)
-    else:
-        origin_name = meta.get("origin_station", "Zürich HB")
-        st.info(f"Dynamic origins not found; using precomputed origin: **{origin_name}**")
-
-    map_mode = st.radio("Map mode", ["Preference score", "Housing only", "Commute only"])
-    penalty_k = float(meta.get("penalty_k", 1.5))
-
-# ---------- Effective commute times ----------
-df = g.copy()
-
-if (
-    tt_by_origin is not None
-    and origin_name in tt_by_origin.get("origin_name", pd.Series(dtype=str)).astype(str).unique()
-):
-    tt_sel = tt_by_origin.loc[
-        tt_by_origin["origin_name"] == origin_name, ["GEMEINDE_CODE", "avg_travel_min"]
-    ].copy()
-else:
-    tt_sel = None
-
-df = enforce_origin_zero_and_shift(df, tt_sel)
-
-# Simplify geometry for speed (no-op if already simple)
-try:
-    df["geometry"] = df.geometry.simplify(0.0005, preserve_topology=True)
-except Exception:
-    pass
-
-# If preference_score missing in artifact, compute on the fly from meta
-if "preference_score" not in df.columns or df["preference_score"].isna().all():
-    w0, a, b = resolve_prior(meta, st.session_state)
-    v_range = robust_range(df["vacancy_pct"])
-    t_range = robust_range(df["avg_travel_min_eff"])
-    V = norm01_clipped(pd.to_numeric(df["vacancy_pct"], errors="coerce").values, *v_range)
-    T = norm01_clipped(pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").values, *t_range)
-    util = w0 + a * V - b * commute_penalty_shape(T, penalty_k)
-    finite = np.isfinite(util)
-    if finite.any():
-        util = util - np.median(util[finite])
-    df["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
+# ------------------------------------------------------------
+# Vacancy loader (handles BFS SDMX)
+# ------------------------------------------------------------
 
 
-# ---------- Scenario scaffolding ----------
-def build_edge_tradeoffs(
-    _df, v_range, t_range, n=10, seed=42, dtnorm_range=(0.05, 0.18), dvnorm_range=(0.10, 0.30)
-):
-    if isinstance(_df, (pd.DataFrame, gpd.GeoDataFrame)):
-        df = _df.copy()
-    else:
-        df = pd.DataFrame(_df)
-    need = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"]
-    for c in need:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[need].copy()
-    df["vacancy_pct"] = pd.to_numeric(df["vacancy_pct"], errors="coerce")
-    df["avg_travel_min"] = pd.to_numeric(df.get("avg_travel_min"), errors="coerce")
-    # if avg_travel_min missing, fallback to effective
-    mask_na = df["avg_travel_min"].isna()
-    if "avg_travel_min_eff" in _df.columns:
-        df.loc[mask_na, "avg_travel_min"] = pd.to_numeric(
-            _df.loc[mask_na, "avg_travel_min_eff"], errors="coerce"
+def _load_vacancy() -> Tuple[pd.DataFrame, dict]:
+    """
+    Parse BFS SDMX export (semicolon-separated) and extract vacancy percentage
+    per municipality for the latest available year.
+
+    Uses:
+      - code: GR_KT_GDE
+      - name: Grossregionen, Kantone, Bezirke und Gemeinden
+      - measure: MEASURE_DIMENSION == 'PC'
+      - type: LEERWOHN_TYP == '_T'
+      - value: OBS_VALUE
+      - year: TIME_PERIOD (take latest)
+    """
+    if not VACANCY_CSV.exists():
+        raise FileNotFoundError(f"Missing vacancy CSV: {VACANCY_CSV}")
+
+    df = robust_read_csv(VACANCY_CSV)
+    cols = list(df.columns)
+    print("▶ Vacancy CSV columns:", cols)
+
+    # Detect columns we need
+    col_code = "GR_KT_GDE"  # present in your probe
+    col_name = "Grossregionen, Kantone, Bezirke und Gemeinden"
+    col_meas = "MEASURE_DIMENSION"
+    col_type = "LEERWOHN_TYP"
+    col_val = "OBS_VALUE"
+    col_year = "TIME_PERIOD"
+
+    for req in [col_code, col_name, col_meas, col_type, col_val, col_year]:
+        if req not in df.columns:
+            raise KeyError(f"Vacancy file missing '{req}'. Present columns: {list(df.columns)}")
+
+    # Filter PC (percentage), total type, latest year
+    sel = df.copy()
+    sel = sel[sel[col_meas].astype(str).str.upper().eq("PC")]
+    sel = sel[sel[col_type].astype(str).str.upper().eq("_T")]
+    years = pd.to_numeric(sel[col_year], errors="coerce")
+    latest = int(years.max())
+    sel = sel[years.eq(latest)].copy()
+
+    # Build result
+    sel["GEMEINDE_CODE"] = sel[col_code].astype(str)
+    sel["GEMEINDE_NAME"] = sel[col_name].astype(str)
+    sel["vacancy_pct"] = pd.to_numeric(sel[col_val], errors="coerce")
+
+    out = (
+        sel[["GEMEINDE_CODE", "GEMEINDE_NAME", "vacancy_pct"]]
+        .groupby(["GEMEINDE_CODE", "GEMEINDE_NAME"], as_index=False)
+        .mean()
+    )
+    meta = {"vacancy_year": latest, "source": "BFS SDMX (PC, _T)"}
+    return out, meta
+
+
+# ------------------------------------------------------------
+# Travel times (fallback: distance-based)
+# ------------------------------------------------------------
+
+DEFAULT_ORIGINS = {
+    "Zürich HB": (47.378177, 8.540192),
+    "Bern": (46.948824, 7.439132),
+    "Basel SBB": (47.547451, 7.589626),
+    "Genève": (46.210206, 6.142439),
+    "Lausanne": (46.516003, 6.629099),
+    "Luzern": (47.050168, 8.310229),
+    "St. Gallen": (47.423180, 9.369775),
+    "Winterthur": (47.499346, 8.724128),
+}
+
+
+def compute_distance_based_tt(
+    g: gpd.GeoDataFrame,
+    origins: dict[str, tuple[float, float]],
+    cruise_kmh: float = 50.0,
+    overhead_min: float = 10.0,
+) -> pd.DataFrame:
+    """
+    Fallback travel times: straight-line distance / speed + overhead.
+    Produces a tidy table: [origin_name, GEMEINDE_CODE, avg_travel_min].
+    """
+    if g.crs is None or str(g.crs).lower() != "epsg:4326":
+        g = g.to_crs(4326)
+    cent = g.geometry.centroid
+    lat = cent.y.values
+    lon = cent.x.values
+
+    rows = []
+    for oname, (olat, olon) in origins.items():
+        dist_km = np.array(
+            [haversine_km(olat, olon, lat[i], lon[i]) for i in range(len(g))], dtype="float64"
         )
-    df = df.dropna(subset=["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"])
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "qid",
-                "A_gem",
-                "A_vacancy_pct",
-                "A_travel_min",
-                "B_gem",
-                "B_vacancy_pct",
-                "B_travel_min",
-            ]
-        )
-
-    v_lo, v_hi = v_range
-    t_lo, t_hi = t_range
-    df["v_n"] = norm01_clipped(df["vacancy_pct"].values, v_lo, v_hi)
-    df["t_n"] = norm01_clipped(df["avg_travel_min"].values, t_lo, t_hi)
-
-    rng = np.random.default_rng(seed)
-    used = set()
-    rows, tries = [], 0
-    while len(rows) < n and tries < 8000:
-        tries += 1
-        A = df.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
-        if A["GEMEINDE_NAME"] in used:
-            continue
-        orientation = int(rng.integers(0, 2))
-        if orientation == 0:
-            cand = df[
-                (df["v_n"] < A["v_n"])
-                & (df["t_n"] < A["t_n"])
-                & ((A["v_n"] - df["v_n"]).between(0.10, 0.30, inclusive="both"))
-                & ((A["t_n"] - df["t_n"]).between(0.05, 0.18, inclusive="both"))
-                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
-            ]
-        else:
-            cand = df[
-                (df["v_n"] > A["v_n"])
-                & (df["t_n"] > A["t_n"])
-                & ((df["v_n"] - A["v_n"]).between(0.10, 0.30, inclusive="both"))
-                & ((df["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both"))
-                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
-            ]
-        if cand.empty:
-            continue
-        B = cand.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
-        rows.append(
+        tt_min = overhead_min + (dist_km / max(cruise_kmh, 1.0)) * 60.0
+        tmp = pd.DataFrame(
             {
-                "qid": len(rows) + 1,
-                "A_gem": A["GEMEINDE_NAME"],
-                "A_vacancy_pct": float(A["vacancy_pct"]),
-                "A_travel_min": float(A["avg_travel_min"]),
-                "B_gem": B["GEMEINDE_NAME"],
-                "B_vacancy_pct": float(B["vacancy_pct"]),
-                "B_travel_min": float(B["avg_travel_min"]),
+                "origin_name": oname,
+                "GEMEINDE_CODE": g["GEMEINDE_CODE"].astype(str).values,
+                "avg_travel_min": tt_min,
             }
         )
-        used.add(A["GEMEINDE_NAME"])
-        used.add(B["GEMEINDE_NAME"])
-    return pd.DataFrame(rows)
+        rows.append(tmp)
+
+    tto = pd.concat(rows, ignore_index=True)
+    return tto
 
 
-# Ranges for scenarios
-v_range = robust_range(df["vacancy_pct"])
-t_range = robust_range(df["avg_travel_min_eff"])
-df_scen = df[["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff"]].copy()
-df_scen = df_scen.rename(columns={"avg_travel_min_eff": "avg_travel_min"})
-sc = build_edge_tradeoffs(df_scen, v_range=v_range, t_range=t_range, n=10, seed=42)
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 
-tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map", "🧭 Preference elicitation", "📄 Data"])
 
-# ---------- Preference elicitation ----------
-with tab_pref:
-    st.subheader("10 trade-off questions")
-    if sc.empty:
-        st.warning("Not enough data to build scenarios.")
+def build_artifacts(
+    origins_csv: str,
+    default_origin: str,
+    penalty_k: float,
+    only_simplified: bool = True,
+) -> None:
+    ensure_dirs()
+
+    print("▶ Checking inputs …")
+    print(f"  • {VACANCY_CSV}: {'OK' if VACANCY_CSV.exists() else 'MISSING'}")
+    print(f"  • {GEMEINDEN_CACHE}: {'OK (local cache)' if GEMEINDEN_CACHE.exists() else 'MISSING'}")
+
+    g = load_gemeinden_geo()
+    print(f"▶ Loading Gemeinde polygons …\n  → {len(g)} polygons")
+
+    v, vmeta = _load_vacancy()
+    print("▶ Read vacancy …")
+
+    # Join vacancy onto polygons (prefer code; fallback name)
+    g["GEMEINDE_CODE"] = g["GEMEINDE_CODE"].astype(str)
+    v["GEMEINDE_CODE"] = v["GEMEINDE_CODE"].astype(str)
+    g = g.merge(v[["GEMEINDE_CODE", "vacancy_pct"]], on="GEMEINDE_CODE", how="left")
+
+    # Origins
+    if origins_csv.strip():
+        origins_list = [s.strip() for s in origins_csv.split(";") if s.strip()]
     else:
-        for _, row in sc.iterrows():
-            st.markdown("---")
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
-                st.markdown(f"**Q{int(row.qid)} – Option A**")
-                st.write(row.A_gem)
-                st.write(f"Vacancy: {row.A_vacancy_pct:.2f}%")
-                st.write(f"Commute: {row.A_travel_min:.1f} min")
-            with c2:
-                st.markdown(f"**Q{int(row.qid)} – Option B**")
-                st.write(row.B_gem)
-                st.write(f"Vacancy: {row.B_vacancy_pct:.2f}%")
-                st.write(f"Commute: {row.B_travel_min:.1f} min")
-            with c3:
-                st.radio(
-                    f"Your choice for Q{int(row.qid)}",
-                    ["A", "B"],
-                    key=f"choice_{int(row.qid)}",
-                    horizontal=True,
-                    index=None,
-                )
+        origins_list = list(DEFAULT_ORIGINS.keys())
 
-# Track answers (kept minimal)
-choices_dict, answered_rows = {}, []
-for _, r in sc.iterrows():
-    key = f"choice_{int(r.qid)}"
-    ch = st.session_state.get(key, None)
-    if ch in ("A", "B"):
-        choices_dict[key] = ch
-        answered_rows.append(r)
-ans_sig = answers_signature(choices_dict) if choices_dict else None
-
-if answered_rows and st.session_state.get("answers_sig") != ans_sig:
-    st.session_state["manual_weights"] = {
-        "w0": 0.0,
-        "w_v": 2.0,
-        "w_t": 2.0,
-        "v_min": float(v_range[0]),
-        "v_max": float(v_range[1]),
-        "t_min": float(t_range[0]),
-        "t_max": float(t_range[1]),
-    }
-    st.session_state["answers_sig"] = ans_sig
-
-# ---------- Data preview ----------
-with tab_data:
-    show = df.copy()
-    show["avg_travel_min_eff"] = pd.to_numeric(show["avg_travel_min_eff"], errors="coerce")
-    cols = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff", "preference_score"]
-    cols = [c for c in cols if c in show.columns]
-    st.dataframe(
-        show[cols].head(50).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
-        width="stretch",
-    )
-    st.caption(f"Total rows: {len(show)}")
-
-# ---------- Map ----------
-with tab_map:
-    if "vacancy_pct" not in df.columns and "avg_travel_min_eff" not in df.columns:
-        st.warning("No municipalities available to render for this selection.")
-        st.stop()
-
-    if map_mode == "Housing only":
-        metric_col = "vacancy_pct"
-        legend = "Vacancy rate (%)"
-        colors = ["red", "yellow", "green"]
-        vals = pd.to_numeric(df["vacancy_pct"], errors="coerce")
-        vmin = float(np.nanpercentile(vals, 1)) if vals.notna().any() else 0.0
-        vmax = float(np.nanpercentile(vals, 99)) if vals.notna().any() else 1.0
-        df_render = df.dropna(subset=[metric_col]).copy()
-
-    elif map_mode == "Commute only":
-        metric_col = "avg_travel_min_eff"
-        legend = "Commute time from origin (min)"
-        colors = ["green", "yellow", "red"]
-        vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
-        vmin = 0.0
-        vmax = float(np.nanpercentile(vals, 99)) if vals.notna().any() else 120.0
-        df_render = df.dropna(subset=[metric_col]).copy()
-
-    else:
-        metric_col = "preference_score"
-        legend = "Preference score (0–100)"
-        colors = ["red", "yellow", "green"]
-        vmin, vmax = 0.0, 100.0
-        df_render = df.dropna(subset=[metric_col]).copy()
-
-    def render_folium(df_map):
-        import branca.colormap as bcm
-        import folium
-        import streamlit.components.v1 as components
-        from streamlit_folium import st_folium
-
-        colormap = bcm.LinearColormap(colors=colors, vmin=vmin, vmax=vmax)
-        colormap.caption = legend
-        m = folium.Map(location=[46.8, 8.2], zoom_start=7, tiles="OpenStreetMap")
-
-        if metric_col == "vacancy_pct":
-            df_map["vacancy_round"] = pd.to_numeric(df_map["vacancy_pct"], errors="coerce").round(2)
-            fields, aliases = ["GEMEINDE_NAME", "vacancy_round"], ["Municipality", "Vacancy (%)"]
-        elif metric_col == "avg_travel_min_eff":
-            df_map["time_round"] = pd.to_numeric(
-                df_map["avg_travel_min_eff"], errors="coerce"
-            ).round(1)
-            fields, aliases = ["GEMEINDE_NAME", "time_round"], ["Municipality", "Commute (min)"]
+    # Make sure we have coordinates for the requested origins (use defaults when missing)
+    origins = {}
+    for o in origins_list:
+        if o in DEFAULT_ORIGINS:
+            origins[o] = DEFAULT_ORIGINS[o]
         else:
-            df_map["score_round"] = pd.to_numeric(
-                df_map["preference_score"], errors="coerce"
-            ).round(1)
-            df_map["vacancy_round"] = pd.to_numeric(df_map["vacancy_pct"], errors="coerce").round(2)
-            df_map["time_round"] = pd.to_numeric(
-                df_map["avg_travel_min_eff"], errors="coerce"
-            ).round(1)
-            fields, aliases = ["GEMEINDE_NAME", "score_round", "vacancy_round", "time_round"], [
-                "Municipality",
-                "Score",
-                "Vacancy (%)",
-                "Commute (min)",
-            ]
+            # Use Zürich HB coords as a generic fallback
+            origins[o] = DEFAULT_ORIGINS["Zürich HB"]
 
-        folium.GeoJson(
-            data=df_map.to_json(),
-            style_function=lambda feat: {
-                "fillColor": (
-                    colormap(float(feat["properties"].get(metric_col)))
-                    if feat["properties"].get(metric_col) is not None
-                    else "#cccccc"
-                ),
-                "color": "white",
-                "weight": 0.2,
-                "fillOpacity": 0.85,
-            },
-            tooltip=folium.features.GeoJsonTooltip(fields=fields, aliases=aliases, localize=True),
-        ).add_to(m)
-        colormap.add_to(m)
+    # Compute travel times (fallback model)
+    print("▶ Computing distance-based travel times …")
+    tt_by_origin = compute_distance_based_tt(g, origins)
 
-        try:
-            st_folium(m, height=720, width=None)
-        except Exception:
-            html = m._repr_html_()
-            components.html(html, height=720, scrolling=False)
+    # Pick default origin times to embed in the simplified file
+    if default_origin not in origins:
+        default_origin = origins_list[0]
+    tdef = tt_by_origin[tt_by_origin["origin_name"] == default_origin][
+        ["GEMEINDE_CODE", "avg_travel_min"]
+    ].copy()
 
-    if df_render.empty:
-        st.warning("No municipalities available to render for this selection.")
-    else:
-        render_folium(df_render)
+    g_out = g.merge(tdef, on="GEMEINDE_CODE", how="left")
+
+    # Preference score embedded (so the app can render immediately)
+    v_n = norm01(g_out["vacancy_pct"])
+    t_n = norm01(g_out["avg_travel_min"])
+    pen = commute_penalty(t_n, penalty_k)
+    # Simple fixed weights; app can still re-weigh interactively
+    w0, a, b = 0.0, 2.0, 2.0
+    util = w0 + a * v_n - b * pen
+    util = util - np.nanmedian(util[np.isfinite(util)])
+    g_out["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
+
+    # Simplify geometry for a small artifact
+    try:
+        g_simpl = g_out.to_crs(3857)
+        g_simpl["geometry"] = g_simpl.geometry.simplify(200, preserve_topology=True)
+        g_simpl = g_simpl.to_crs(4326)
+    except Exception:
+        g_simpl = g_out.copy()
+
+    keep = [
+        "GEMEINDE_CODE",
+        "GEMEINDE_NAME",
+        "vacancy_pct",
+        "avg_travel_min",
+        "preference_score",
+        "geometry",
+    ]
+    g_simpl = g_simpl[keep]
+
+    # Write artifacts
+    print("▶ Exporting artifacts …")
+    simplified_path = ARTIFACTS / "gemeinden_simplified.geojson"
+    g_simpl.to_file(simplified_path, driver="GeoJSON")
+    print(f"  → wrote {simplified_path}")
+
+    # Copy into app/data
+    (APP_DATA / "gemeinden_simplified.geojson").write_text(
+        simplified_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    print("  → copied gemeinden_simplified.geojson to app/data/")
+
+    # tt_by_origin (for multiple origins in the app)
+    tt_parquet = APP_DATA / "tt_by_origin.parquet"
+    tt_by_origin.to_parquet(tt_parquet, index=False)
+    print(f"  → wrote {tt_parquet}")
+
+    # meta
+    meta = {
+        "origin_station": default_origin,
+        "penalty_k": penalty_k,
+        "vacancy_year": vmeta.get("vacancy_year"),
+        "canonical_weights": {"w0": 0.0, "a": 2.0, "b": 2.0},
+    }
+    (APP_DATA / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print("  → wrote app/data/meta.json")
+
+    print("✅ Done. Artifacts in:", ARTIFACTS)
+    print("✅ App data synced to:", APP_DATA)
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--origins",
+        type=str,
+        default="Zürich HB;Bern;Basel SBB;Genève;Lausanne;Luzern;St. Gallen;Winterthur",
+    )
+    p.add_argument("--default-origin", type=str, default="Zürich HB")
+    p.add_argument("--penalty-k", type=float, default=1.5)
+    p.add_argument(
+        "--only-simplified",
+        action="store_true",
+        default=True,
+        help="Kept for compatibility; this builder always writes only simplified artifacts.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    ensure_dirs()
+    build_artifacts(
+        origins_csv=args.origins,
+        default_origin=args.default_origin,
+        penalty_k=args.penalty_k,
+        only_simplified=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
