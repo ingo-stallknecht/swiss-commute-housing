@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 [![Tests](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml)
 [![CI](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml)
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://YOUR-STREAMLIT-APP-LINK)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
 ![Last Commit](https://img.shields.io/github/last-commit/ingo-stallknecht/swiss-commute-housing)
 
 Interactive **Streamlit app** to explore the trade-off between **housing availability** and **public transport accessibility** across Swiss municipalities.
@@ -18,8 +18,8 @@ Interactive **Streamlit app** to explore the trade-off between **housing availab
 
 ## 🚀 Live Demo
 
-👉 **Streamlit App:** [Live link here](https://YOUR-STREAMLIT-APP-LINK)  
-👉 **Colab Notebook:** [Notebook link here](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/colab_main.ipynb)
+👉 **Streamlit App:** [Live link here](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)  
+👉 **Colab Notebook:** [Notebook link here](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/swiss_commute_housing.ipynb)
 
 📸 *Screenshot of the app interface:*  
 ![App Screenshot](assets/screenshot_app.png)
@@ -35,28 +35,42 @@ This tool helps answer:
 
 ---
 
-## 📊 Data Science Approach
+## ⚙️ Technical Approach
 
-- **Inputs**
-  - BFS housing vacancy (municipality level)
-  - GTFS Swiss rail timetables
-  - Gemeinde polygons (OpenDataSoft)
+This project demonstrates a full **data → geospatial → ML-style scoring → app deployment** pipeline:
 
-- **Processing**
-  - Parse BFS-like CSV headers robustly  
-  - Build GTFS station graph and compute travel times (multi-origin)  
-  - Join vacancy rates + average travel minutes  
+### 1. Data Sources
+- **Housing vacancy**: BFS *Leerwohnungszählung* (annual survey of vacant dwellings).  
+  - BFS exports come in *multi-header CSV format*.  
+  - Implemented a **robust parser** (`io_utils.py`) that auto-detects header lines and normalizes percentage values.  
+- **GTFS transport**: Official SBB GTFS feed (`stops.txt`, `trips.txt`, `routes.txt`, `stop_times.txt`).  
+- **Geospatial data**: Gemeinde boundaries from OpenDataSoft.  
+  - CRS conversions: LV95 (EPSG:2056) ↔ WGS84 (EPSG:4326).  
+  - Geometry simplification for efficient app rendering.  
 
-- **Scoring**
-  - Normalize vacancy & commute into [0,1]  
-  - Apply exponential commute penalty  
-  - Logistic squashing → preference score (0–100)  
+### 2. Commute Time Computation
+- Built a **station graph** from GTFS tables (`gtfs_graph.py`).  
+- Implemented **shortest-path traversal** to compute **average travel minutes** from any chosen origin station to all municipalities.  
+- Aggregated station-level travel times to **municipality polygons** by centroid mapping.  
 
-- **Artifacts**
-  - `gemeinden.geojson`, `gemeinden.csv`  
-  - `gemeinden_centroids.parquet`  
-  - `meta.json` (scoring params)  
-  - `tt_by_origin.parquet` (multi-origin travel times)  
+### 3. Preference Scoring
+- Normalized vacancy (%) and commute minutes into [0,1] robustly.  
+- Applied an **exponential penalty function** for commute times (more punishing for long commutes).  
+- Combined housing + commute via **logistic utility model** → interpretable 0–100 preference score.  
+- Hyperparameters (`a`, `b`, `k`) adjustable in app controls.  
+
+### 4. Reproducible Artifacts
+- Automated pipeline (`make_artifacts.py`) builds:
+  - `gemeinden.geojson` (full geometry)  
+  - `gemeinden_simplified.geojson` (lightweight polygons)  
+  - `gemeinden_centroids.parquet` (map hover points)  
+  - `meta.json` (scoring parameters)  
+  - `tt_by_origin.parquet` (multi-origin commute times)  
+
+### 5. Deployment
+- **Streamlit UI** (`app/app.py`) with Folium/Deck.gl maps.  
+- **Dockerized + GitHub CI** for reproducibility.  
+- Hosted on **Streamlit Cloud** with automatic redeploys on push.  
 
 ---
 
