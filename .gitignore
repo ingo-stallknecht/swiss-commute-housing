@@ -34,3 +34,6 @@ data/artifacts/**
 data/gemeinden_cache.geojson
 data/gtfs/**
 data/artifacts/**
+
+# app big geojson (use simplified instead)
+app/data/gemeinden.geojson
