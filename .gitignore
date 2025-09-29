@@ -1,28 +1,26 @@
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.env
-.venv
-venv/
-.envrc
 
-# Data
-data/artifacts/
-data/raw/*.zip
-data/raw/*.7z
-data/raw/*.rar
-data/raw/*.tar
-data/raw/*.gz
-data/raw/*.csv
+# Virtual env
+.venv/
 
-# Notebooks
+# Jupyter
 .ipynb_checkpoints/
+
+# Local data & artifacts
+data/gtfs/
+data/artifacts/
+app/data/tt_by_origin.parquet
+
+# Build/egg-info created by editable installs
+*.egg-info/
+src/*.egg-info/
+dist/
+build/
 
 # OS/editor
 .DS_Store
 Thumbs.db
-
-# Streamlit logs
-.streamlit/
+.vscode/
+.idea/
