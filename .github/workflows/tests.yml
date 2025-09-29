@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install project and dev deps
+        run: |
+          # Prefer binary wheels for geospatial libs to keep CI fast & reliable
+          pip install --only-binary=:all: shapely pyproj rtree fiona pyogrio geopandas || true
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run tests
+        run: |
+          pytest

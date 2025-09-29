@@ -1,0 +1,37 @@
+# Use the Python from your virtual environment
+PY := .venv/Scripts/python
+
+.PHONY: venv install artifacts app fmt lint precommit
+
+# Create virtual environment
+venv:
+	python -m venv .venv
+
+# Install dependencies
+install: venv
+	$(PY) -m pip install -U pip
+	$(PY) -m pip install -r requirements.txt
+	$(PY) -m pip install pre-commit
+
+# Rebuild artifacts (GeoJSON, CSV, etc.)
+artifacts:
+	$(PY) scripts/make_artifacts.py
+
+# Launch the Streamlit app
+app:
+	$(PY) scripts/launch_app.py
+
+# Format code
+fmt:
+	$(PY) -m black .
+	$(PY) -m isort .
+
+# Lint code (check style without changing files)
+lint:
+	$(PY) -m flake8 .
+	$(PY) -m black --check .
+	$(PY) -m isort --check-only .
+
+# Run pre-commit hooks on all files
+precommit:
+	pre-commit run --all-files

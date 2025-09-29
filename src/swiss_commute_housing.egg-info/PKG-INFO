@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: swiss-commute-housing
+Version: 0.1.0
+Summary: Swiss Commute & Housing Explorer
+Requires-Python: >=3.11
+License-File: LICENSE
+Dynamic: license-file

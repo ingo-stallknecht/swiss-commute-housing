@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+.envrc
+
+# Data
+data/artifacts/
+data/raw/*.zip
+data/raw/*.7z
+data/raw/*.rar
+data/raw/*.tar
+data/raw/*.gz
+data/raw/*.csv
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Streamlit logs
+.streamlit/

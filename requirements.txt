@@ -1,0 +1,40 @@
+# Core data libraries
+numpy
+pandas
+
+# Geospatial
+geopandas
+shapely
+pyproj
+rtree
+fiona
+pyogrio
+
+# Visualization / mapping
+matplotlib
+matplotlib-scalebar
+folium
+branca
+pydeck
+
+# App framework
+streamlit
+streamlit-folium
+
+# File formats
+openpyxl
+odfpy
+
+# Parquet IO (needed for tt_by_origin.parquet)
+pyarrow
+# (optional alternative) fastparquet
+
+# Notebook support
+jupyterlab
+ipykernel
+
+# Code quality / precommit hooks
+black
+isort
+flake8
+pre-commit
