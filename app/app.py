@@ -11,6 +11,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# ---------- App-wide cache buster ----------
+# Bump this string any time you want Streamlit Cloud to invalidate cached data.
+CACHE_VERSION = "v2"
+
 # ---------- Setup ----------
 try:
     BASE_DIR = Path(__file__).resolve().parent
@@ -54,7 +58,8 @@ def commute_penalty_shape(t_norm, k):
 def enforce_origin_zero_and_shift(
     df_wgs84: gpd.GeoDataFrame, tt_sel: pd.DataFrame | None
 ) -> gpd.GeoDataFrame:
-    """Apply origin-specific travel times if provided; otherwise fall back safely.
+    """
+    Apply origin-specific travel times if provided; otherwise fall back safely.
 
     Ensures columns exist and handles the case where the GeoJSON has no
     'avg_travel_min' at all (e.g., simplified artifacts). In that case we keep
@@ -70,23 +75,21 @@ def enforce_origin_zero_and_shift(
     # Start with the base column as the effective one
     df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
 
-    # If we have origin-specific times, left-merge and prefer those
+    # If we have origin-specific times, left-merge and prefer those (no combine_first)
     if tt_sel is not None and not tt_sel.empty:
         tmp = tt_sel[["GEMEINDE_CODE", "avg_travel_min"]].copy()
         tmp["GEMEINDE_CODE"] = tmp["GEMEINDE_CODE"].astype(str)
         tmp = tmp.rename(columns={"avg_travel_min": "avg_travel_min_origin"})
         df = df.merge(tmp, on="GEMEINDE_CODE", how="left")
-        # Prefer origin-specific where available, else keep base
-        df["avg_travel_min_eff"] = df["avg_travel_min_origin"].where(
-            pd.to_numeric(df["avg_travel_min_origin"], errors="coerce").notna(),
-            df["avg_travel_min_eff"],
-        )
+
+        origin_vals = pd.to_numeric(df["avg_travel_min_origin"], errors="coerce")
+        base_vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
+        df["avg_travel_min_eff"] = np.where(origin_vals.notna(), origin_vals, base_vals)
 
     # Shift so the best (minimum) becomes 0, if we have any finite values
     cur = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
     if np.isfinite(cur).any():
         mmin = float(np.nanmin(cur))
-        # 0 for the minimum; subtract min for all others
         df.loc[cur == mmin, "avg_travel_min_eff"] = 0.0
         df.loc[cur != mmin, "avg_travel_min_eff"] = (cur - mmin)[cur != mmin]
 
@@ -170,7 +173,6 @@ def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
     try:
         gj = json.loads(raw.decode("utf-8", errors="strict"))
     except Exception as e:
-        # fallback encodings
         gj = None
         for enc in ("utf-8-sig", "latin-1"):
             try:
@@ -183,6 +185,7 @@ def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
 
     if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection":
         raise ValueError(f"Not a FeatureCollection: {p}")
+
     feats = gj.get("features", [])
     if not feats:
         raise ValueError(f"FeatureCollection has no features: {p}")
@@ -194,7 +197,7 @@ def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_data():
+def load_data(_cache_buster: str):
     # Prefer smaller/simplified file first for cloud robustness
     simplified = DATA_DIR / "gemeinden_simplified.geojson"
     full = DATA_DIR / "gemeinden.geojson"
@@ -231,14 +234,9 @@ def load_data():
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
 
-    # Coerce known numeric columns if present
     for c in ["vacancy_pct", "avg_travel_min", "preference_score"]:
         if c in g.columns:
             g[c] = pd.to_numeric(g[c], errors="coerce")
-
-    # Ensure base commute column exists (for simplified artifacts)
-    if "avg_travel_min" not in g.columns:
-        g["avg_travel_min"] = np.nan
 
     # Try Parquet for dynamic origins; fallback to CSV
     tto = None
@@ -262,7 +260,7 @@ def load_data():
 
 
 # ---------- App ----------
-g, meta, tt_by_origin = load_data()
+g, meta, tt_by_origin = load_data(CACHE_VERSION)
 
 st.title("Swiss Housing & Commute Explorer")
 st.markdown(
@@ -274,6 +272,11 @@ st.markdown(
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("Controls")
+
+    # Clear-cache button for Cloud debugging
+    if st.button("♻️ Clear cache & rerun"):
+        st.cache_data.clear()
+        st.rerun()
 
     def _is_bahn2000(name: str) -> bool:
         s = str(name).lower()
@@ -338,12 +341,10 @@ def build_edge_tradeoffs(
         df = _df.copy()
     else:
         df = pd.DataFrame(_df)
-
     need = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"]
     for c in need:
         if c not in df.columns:
             df[c] = np.nan
-
     df = df[need].copy()
     df["vacancy_pct"] = pd.to_numeric(df["vacancy_pct"], errors="coerce")
     df["avg_travel_min"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
@@ -360,12 +361,10 @@ def build_edge_tradeoffs(
                 "B_travel_min",
             ]
         )
-
     v_lo, v_hi = v_range
     t_lo, t_hi = t_range
     df["v_n"] = norm01_clipped(df["vacancy_pct"].values, v_lo, v_hi)
     df["t_n"] = norm01_clipped(df["avg_travel_min"].values, t_lo, t_hi)
-
     rng = np.random.default_rng(seed)
     used = set()
     rows = []
@@ -375,7 +374,6 @@ def build_edge_tradeoffs(
         A = df.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
         if A["GEMEINDE_NAME"] in used:
             continue
-
         orientation = int(rng.integers(0, 2))
         if orientation == 0:
             cand = df[
@@ -393,10 +391,8 @@ def build_edge_tradeoffs(
                 & ((df["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both"))
                 & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
             ]
-
         if cand.empty:
             continue
-
         B = cand.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
         rows.append(
             {
@@ -411,7 +407,6 @@ def build_edge_tradeoffs(
         )
         used.add(A["GEMEINDE_NAME"])
         used.add(B["GEMEINDE_NAME"])
-
     return pd.DataFrame(rows)
 
 
@@ -477,7 +472,10 @@ with tab_data:
     show["avg_travel_min_eff"] = pd.to_numeric(show["avg_travel_min_eff"], errors="coerce")
     cols = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff", "preference_score"]
     cols = [c for c in cols if c in show.columns]
-    st.dataframe(show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}))
+    st.dataframe(
+        show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
+        width="stretch",  # replaces deprecated use_container_width
+    )
     st.caption(f"Total rows: {len(show)}")
 
 # ---------- Map ----------
