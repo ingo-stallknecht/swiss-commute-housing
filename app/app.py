@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-import os
-import json
 import hashlib
+import json
+import os
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import streamlit as st
 
 # ---------- Setup ----------
@@ -17,6 +17,7 @@ except NameError:
 DATA_DIR = BASE_DIR / "data"
 
 st.set_page_config(page_title="Swiss Housing & Commute Explorer", layout="wide")
+
 
 # ---------- Utils ----------
 def robust_range(series_like, lo_q=1, hi_q=99):
@@ -32,6 +33,7 @@ def robust_range(series_like, lo_q=1, hi_q=99):
         lo, hi = 0.0, 1.0
     return lo, hi
 
+
 def norm01_clipped(x, lo, hi):
     x = np.asarray(x, dtype="float64")
     lo, hi = float(lo), float(hi)
@@ -40,80 +42,125 @@ def norm01_clipped(x, lo, hi):
     x = np.clip(x, lo, hi)
     return (x - lo) / (hi - lo)
 
+
 def commute_penalty_shape(t_norm, k):
     t = np.clip(np.asarray(t_norm, dtype="float64"), 0.0, 1.0)
     kk = max(0.2, float(k))
     return 1.0 - np.power(1.0 - t, kk)
 
-def enforce_origin_zero_and_shift(df_wgs84: gpd.GeoDataFrame,
-                                  tt_sel: pd.DataFrame | None) -> gpd.GeoDataFrame:
+
+def enforce_origin_zero_and_shift(
+    df_wgs84: gpd.GeoDataFrame, tt_sel: pd.DataFrame | None
+) -> gpd.GeoDataFrame:
     df = df_wgs84.copy()
     df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
     if tt_sel is not None and not tt_sel.empty:
-        tmp = tt_sel[["GEMEINDE_CODE","avg_travel_min"]].copy()
+        tmp = tt_sel[["GEMEINDE_CODE", "avg_travel_min"]].copy()
         tmp = tmp.rename(columns={"avg_travel_min": "avg_travel_min_origin"})
         tmp["GEMEINDE_CODE"] = tmp["GEMEINDE_CODE"].astype(str)
         df = df.merge(tmp, on="GEMEINDE_CODE", how="left")
-        df["avg_travel_min_eff"] = df["avg_travel_min_origin"].combine_first(df.get("avg_travel_min"))
+        df["avg_travel_min_eff"] = df["avg_travel_min_origin"].combine_first(
+            df.get("avg_travel_min")
+        )
     else:
         df["avg_travel_min_eff"] = df.get("avg_travel_min")
     cur = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
     if cur.notna().any():
         mmin = float(np.nanmin(cur))
-        min_mask = (cur == mmin)
+        min_mask = cur == mmin
         df.loc[min_mask, "avg_travel_min_eff"] = 0.0
         df.loc[~min_mask, "avg_travel_min_eff"] = (cur - mmin)[~min_mask]
-    df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").clip(lower=0)
+    df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").clip(
+        lower=0
+    )
     return df
+
 
 def resolve_prior(meta, session):
     if "manual_weights" in session:
         mw = session["manual_weights"]
-        return (float(mw.get("w0", 0.0)),
-                float(max(0.0, mw.get("w_v", 2.0))),
-                float(max(0.0, mw.get("w_t", 2.0))))
+        return (
+            float(mw.get("w0", 0.0)),
+            float(max(0.0, mw.get("w_v", 2.0))),
+            float(max(0.0, mw.get("w_t", 2.0))),
+        )
     try:
         cw = meta["canonical_weights"]
-        return (float(cw.get("w0", 0.0)),
-                float(max(0.0, cw.get("a", 2.0))),
-                float(max(0.0, cw.get("b", 2.0))))
+        return (
+            float(cw.get("w0", 0.0)),
+            float(max(0.0, cw.get("a", 2.0))),
+            float(max(0.0, cw.get("b", 2.0))),
+        )
     except Exception:
         return (0.0, 2.0, 2.0)
+
 
 def answers_signature(choices_dict):
     key_order = sorted(choices_dict.keys())
     s = "|".join(f"{k}:{choices_dict[k]}" for k in key_order)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 @st.cache_data(show_spinner=False)
 def build_anchor_pairs(v_range, t_range, n_each=3, dv_n=0.18, dt_n=0.10):
-    v_lo, v_hi = v_range; t_lo, t_hi = t_range
+    v_lo, v_hi = v_range
+    t_lo, t_hi = t_range
     v_mid = (v_lo + v_hi) / 2.0
     t_mid = (t_lo + t_hi) / 2.0
     dv = dv_n * (v_hi - v_lo)
     dt = dt_n * (t_hi - t_lo)
     rows = []
     for _ in range(n_each):
-        rows.append({"A_vacancy_pct": v_mid, "A_travel_min": t_mid - dt,
-                     "B_vacancy_pct": v_mid, "B_travel_min": t_mid + dt,
-                     "choice": "A", "w": 0.15})
-        rows.append({"A_vacancy_pct": v_mid + dv, "A_travel_min": t_mid,
-                     "B_vacancy_pct": v_mid - dv, "B_travel_min": t_mid,
-                     "choice": "A", "w": 0.15})
+        rows.append(
+            {
+                "A_vacancy_pct": v_mid,
+                "A_travel_min": t_mid - dt,
+                "B_vacancy_pct": v_mid,
+                "B_travel_min": t_mid + dt,
+                "choice": "A",
+                "w": 0.15,
+            }
+        )
+        rows.append(
+            {
+                "A_vacancy_pct": v_mid + dv,
+                "A_travel_min": t_mid,
+                "B_vacancy_pct": v_mid - dv,
+                "B_travel_min": t_mid,
+                "choice": "A",
+                "w": 0.15,
+            }
+        )
     return pd.DataFrame(rows)
 
-def fit_logistic_weighted(sc_df, v_range, t_range, k_ref,
-                          prior=(0.0,2.0,2.0), l2=0.25,
-                          clip_w0=(-1.5,1.5), clip_a=(0.0,4.0), clip_b=(0.0,4.0),
-                          iters=800, lr=0.25):
-    v_lo, v_hi = v_range; t_lo, t_hi = t_range
-    vA = sc_df["A_vacancy_pct"].values; vB = sc_df["B_vacancy_pct"].values
-    tA = sc_df["A_travel_min"].values;  tB = sc_df["B_travel_min"].values
-    y  = (sc_df["choice"].values == "A").astype(float)
+
+def fit_logistic_weighted(
+    sc_df,
+    v_range,
+    t_range,
+    k_ref,
+    prior=(0.0, 2.0, 2.0),
+    l2=0.25,
+    clip_w0=(-1.5, 1.5),
+    clip_a=(0.0, 4.0),
+    clip_b=(0.0, 4.0),
+    iters=800,
+    lr=0.25,
+):
+    v_lo, v_hi = v_range
+    t_lo, t_hi = t_range
+    vA = sc_df["A_vacancy_pct"].values
+    vB = sc_df["B_vacancy_pct"].values
+    tA = sc_df["A_travel_min"].values
+    tB = sc_df["B_travel_min"].values
+    y = (sc_df["choice"].values == "A").astype(float)
     w_samp = sc_df.get("w", pd.Series(1.0, index=sc_df.index)).values.astype("float64")
-    Va = norm01_clipped(vA, v_lo, v_hi); Vb = norm01_clipped(vB, v_lo, v_hi)
-    Ta = norm01_clipped(tA, t_lo, t_hi); Tb = norm01_clipped(tB, t_lo, t_hi)
-    Pa = commute_penalty_shape(Ta, k_ref); Pb = commute_penalty_shape(Tb, k_ref)
+    Va = norm01_clipped(vA, v_lo, v_hi)
+    Vb = norm01_clipped(vB, v_lo, v_hi)
+    Ta = norm01_clipped(tA, t_lo, t_hi)
+    Tb = norm01_clipped(tB, t_lo, t_hi)
+    Pa = commute_penalty_shape(Ta, k_ref)
+    Pb = commute_penalty_shape(Tb, k_ref)
     X = np.column_stack([np.ones(len(sc_df)), (Va - Vb), -(Pa - Pb)])  # [w0,a,b]
     w = np.array(prior, dtype="float64")
     denom = max(1.0, np.sum(w_samp))
@@ -123,9 +170,13 @@ def fit_logistic_weighted(sc_df, v_range, t_range, k_ref,
         grad_ll = X.T @ ((y - p) * w_samp) / denom
         grad_prior = -l2 * (w - np.array(prior))
         w += lr * (grad_ll + grad_prior)
-        w[0] = np.clip(w[0], *clip_w0); w[1] = np.clip(w[1], *clip_a); w[2] = np.clip(w[2], *clip_b)
-    w[1] = max(0.0, w[1]); w[2] = max(0.0, w[2])
+        w[0] = np.clip(w[0], *clip_w0)
+        w[1] = np.clip(w[1], *clip_a)
+        w[2] = np.clip(w[2], *clip_b)
+    w[1] = max(0.0, w[1])
+    w[2] = max(0.0, w[2])
     return tuple(w)
+
 
 @st.cache_data(show_spinner=False)
 def load_data():
@@ -138,7 +189,7 @@ def load_data():
     g = gpd.read_file(str(gj))
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
-    for c in ["vacancy_pct","avg_travel_min","preference_score"]:
+    for c in ["vacancy_pct", "avg_travel_min", "preference_score"]:
         if c in g.columns:
             g[c] = pd.to_numeric(g[c], errors="coerce")
     meta = json.loads((mj).read_text(encoding="utf-8"))
@@ -170,6 +221,7 @@ def load_data():
 
     return g, meta, tto
 
+
 # ---------- App ----------
 g, meta, tt_by_origin = load_data()
 
@@ -188,7 +240,11 @@ with st.sidebar:
         s = str(name).lower()
         return ("bahn" in s) and ("2000" in s)
 
-    if tt_by_origin is not None and "origin_name" in tt_by_origin.columns and tt_by_origin["origin_name"].notna().any():
+    if (
+        tt_by_origin is not None
+        and "origin_name" in tt_by_origin.columns
+        and tt_by_origin["origin_name"].notna().any()
+    ):
         stations_raw = tt_by_origin["origin_name"].dropna().astype(str).unique().tolist()
         stations = sorted([s for s in stations_raw if not _is_bahn2000(s)], key=str.casefold)
         default_origin = meta.get("origin_station", "Zürich HB")
@@ -198,19 +254,27 @@ with st.sidebar:
         origin_name = meta.get("origin_station", "Zürich HB")
         st.info(f"Dynamic origins not found; using precomputed origin: **{origin_name}**")
 
-    map_mode = st.radio("Map mode", ["Preference score","Housing only","Commute only"])
+    map_mode = st.radio("Map mode", ["Preference score", "Housing only", "Commute only"])
     penalty_k = st.slider(
         "Commute penalty curvature (k)",
-        0.2, 6.0, float(meta.get("penalty_k", 1.5)), 0.1,
-        help="Adjusts the curvature used in Preference score."
+        0.2,
+        6.0,
+        float(meta.get("penalty_k", 1.5)),
+        0.1,
+        help="Adjusts the curvature used in Preference score.",
     )
 
 # ---------- Effective commute times ----------
 df = g.copy()
 df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
 
-if tt_by_origin is not None and origin_name in tt_by_origin.get("origin_name", pd.Series(dtype=str)).astype(str).unique():
-    tt_sel = tt_by_origin.loc[tt_by_origin["origin_name"] == origin_name, ["GEMEINDE_CODE","avg_travel_min"]].copy()
+if (
+    tt_by_origin is not None
+    and origin_name in tt_by_origin.get("origin_name", pd.Series(dtype=str)).astype(str).unique()
+):
+    tt_sel = tt_by_origin.loc[
+        tt_by_origin["origin_name"] == origin_name, ["GEMEINDE_CODE", "avg_travel_min"]
+    ].copy()
 else:
     tt_sel = None
 
@@ -226,30 +290,43 @@ except Exception:
 v_range = robust_range(df["vacancy_pct"])
 t_range = robust_range(df["avg_travel_min_eff"])
 
+
 # ---------- Scenario scaffolding (edge-case tradeoffs) ----------
-def build_edge_tradeoffs(_df, v_range, t_range, n=10, seed=42,
-                         dtnorm_range=(0.05, 0.18), dvnorm_range=(0.10, 0.30)):
+def build_edge_tradeoffs(
+    _df, v_range, t_range, n=10, seed=42, dtnorm_range=(0.05, 0.18), dvnorm_range=(0.10, 0.30)
+):
     if isinstance(_df, (pd.DataFrame, gpd.GeoDataFrame)):
         df = _df.copy()
     else:
         df = pd.DataFrame(_df)
-    need = ["GEMEINDE_NAME","vacancy_pct","avg_travel_min"]
+    need = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"]
     for c in need:
         if c not in df.columns:
             df[c] = np.nan
     df = df[need].copy()
-    df["vacancy_pct"]    = pd.to_numeric(df["vacancy_pct"], errors="coerce")
+    df["vacancy_pct"] = pd.to_numeric(df["vacancy_pct"], errors="coerce")
     df["avg_travel_min"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
-    df = df.dropna(subset=["GEMEINDE_NAME","vacancy_pct","avg_travel_min"])
+    df = df.dropna(subset=["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min"])
     if df.empty:
-        return pd.DataFrame(columns=[
-            "qid","A_gem","A_vacancy_pct","A_travel_min","B_gem","B_vacancy_pct","B_travel_min"
-        ])
-    v_lo, v_hi = v_range; t_lo, t_hi = t_range
+        return pd.DataFrame(
+            columns=[
+                "qid",
+                "A_gem",
+                "A_vacancy_pct",
+                "A_travel_min",
+                "B_gem",
+                "B_vacancy_pct",
+                "B_travel_min",
+            ]
+        )
+    v_lo, v_hi = v_range
+    t_lo, t_hi = t_range
     df["v_n"] = norm01_clipped(df["vacancy_pct"].values, v_lo, v_hi)
     df["t_n"] = norm01_clipped(df["avg_travel_min"].values, t_lo, t_hi)
     rng = np.random.default_rng(seed)
-    used = set(); rows = []; tries = 0
+    used = set()
+    rows = []
+    tries = 0
     while len(rows) < n and tries < 8000:
         tries += 1
         A = df.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
@@ -258,36 +335,44 @@ def build_edge_tradeoffs(_df, v_range, t_range, n=10, seed=42,
         orientation = int(rng.integers(0, 2))
         if orientation == 0:
             cand = df[
-                (df["v_n"] < A["v_n"]) &
-                (df["t_n"] < A["t_n"]) &
-                ((A["v_n"] - df["v_n"]).between(0.10, 0.30, inclusive="both")) &
-                ((A["t_n"] - df["t_n"]).between(0.05, 0.18, inclusive="both")) &
-                (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
+                (df["v_n"] < A["v_n"])
+                & (df["t_n"] < A["t_n"])
+                & ((A["v_n"] - df["v_n"]).between(0.10, 0.30, inclusive="both"))
+                & ((A["t_n"] - df["t_n"]).between(0.05, 0.18, inclusive="both"))
+                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
             ]
         else:
             cand = df[
-                (df["v_n"] > A["v_n"]) &
-                (df["t_n"] > A["t_n"]) &
-                ((df["v_n"] - A["v_n"]).between(0.10, 0.30, inclusive="both")) &
-                ((df["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both")) &
-                (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
+                (df["v_n"] > A["v_n"])
+                & (df["t_n"] > A["t_n"])
+                & ((df["v_n"] - A["v_n"]).between(0.10, 0.30, inclusive="both"))
+                & ((df["t_n"] - A["t_n"]).between(0.05, 0.18, inclusive="both"))
+                & (~df["GEMEINDE_NAME"].isin(used | {A["GEMEINDE_NAME"]}))
             ]
         if cand.empty:
             continue
         B = cand.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
-        rows.append({
-            "qid": len(rows)+1,
-            "A_gem": A["GEMEINDE_NAME"], "A_vacancy_pct": float(A["vacancy_pct"]), "A_travel_min": float(A["avg_travel_min"]),
-            "B_gem": B["GEMEINDE_NAME"], "B_vacancy_pct": float(B["vacancy_pct"]), "B_travel_min": float(B["avg_travel_min"]),
-        })
-        used.add(A["GEMEINDE_NAME"]); used.add(B["GEMEINDE_NAME"])
+        rows.append(
+            {
+                "qid": len(rows) + 1,
+                "A_gem": A["GEMEINDE_NAME"],
+                "A_vacancy_pct": float(A["vacancy_pct"]),
+                "A_travel_min": float(A["avg_travel_min"]),
+                "B_gem": B["GEMEINDE_NAME"],
+                "B_vacancy_pct": float(B["vacancy_pct"]),
+                "B_travel_min": float(B["avg_travel_min"]),
+            }
+        )
+        used.add(A["GEMEINDE_NAME"])
+        used.add(B["GEMEINDE_NAME"])
     return pd.DataFrame(rows)
 
-df_scen = df[["GEMEINDE_NAME","vacancy_pct","avg_travel_min_eff"]].copy()
-df_scen = df_scen.rename(columns={"avg_travel_min_eff":"avg_travel_min"})
+
+df_scen = df[["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff"]].copy()
+df_scen = df_scen.rename(columns={"avg_travel_min_eff": "avg_travel_min"})
 sc = build_edge_tradeoffs(df_scen, v_range=v_range, t_range=t_range, n=10, seed=42)
 
-tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map","🧭 Preference elicitation","📄 Data"])
+tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map", "🧭 Preference elicitation", "📄 Data"])
 
 # ---------- Preference elicitation ----------
 with tab_pref:
@@ -297,7 +382,7 @@ with tab_pref:
     else:
         for _, row in sc.iterrows():
             st.markdown("---")
-            c1, c2, c3 = st.columns([1,1,1])
+            c1, c2, c3 = st.columns([1, 1, 1])
             with c1:
                 st.markdown(f"**Q{int(row.qid)} – Option A**")
                 st.write(row.A_gem)
@@ -311,8 +396,10 @@ with tab_pref:
             with c3:
                 st.radio(
                     f"Your choice for Q{int(row.qid)}",
-                    ["A","B"], key=f"choice_{int(row.qid)}",
-                    horizontal=True, index=None
+                    ["A", "B"],
+                    key=f"choice_{int(row.qid)}",
+                    horizontal=True,
+                    index=None,
                 )
 
 # Track answers (optional quick-fit kept minimal)
@@ -320,16 +407,20 @@ choices_dict, answered_rows = {}, []
 for _, r in sc.iterrows():
     key = f"choice_{int(r.qid)}"
     ch = st.session_state.get(key, None)
-    if ch in ("A","B"):
+    if ch in ("A", "B"):
         choices_dict[key] = ch
         answered_rows.append(r)
 ans_sig = answers_signature(choices_dict) if choices_dict else None
 
 if answered_rows and st.session_state.get("answers_sig") != ans_sig:
     st.session_state["manual_weights"] = {
-        "w0": 0.0, "w_v": 2.0, "w_t": 2.0,
-        "v_min": float(v_range[0]), "v_max": float(v_range[1]),
-        "t_min": float(t_range[0]), "t_max": float(t_range[1]),
+        "w0": 0.0,
+        "w_v": 2.0,
+        "w_t": 2.0,
+        "v_min": float(v_range[0]),
+        "v_max": float(v_range[1]),
+        "t_min": float(t_range[0]),
+        "t_max": float(t_range[1]),
     }
     st.session_state["answers_sig"] = ans_sig
 
@@ -337,44 +428,60 @@ if answered_rows and st.session_state.get("answers_sig") != ans_sig:
 with tab_data:
     show = df.copy()
     show["avg_travel_min_eff"] = pd.to_numeric(show["avg_travel_min_eff"], errors="coerce")
-    cols = ["GEMEINDE_NAME","vacancy_pct","avg_travel_min_eff","preference_score"]
+    cols = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff", "preference_score"]
     cols = [c for c in cols if c in show.columns]
-    st.dataframe(show[cols].head(30).rename(columns={"avg_travel_min_eff":"avg_travel_min"}), use_container_width=True)
+    st.dataframe(
+        show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
+        use_container_width=True,
+    )
     st.caption(f"Total rows: {len(show)}")
 
 # ---------- Map ----------
 with tab_map:
     if map_mode == "Housing only":
-        metric_col = "vacancy_pct"; legend = "Vacancy rate (%)"; colors = ["red","yellow","green"]
+        metric_col = "vacancy_pct"
+        legend = "Vacancy rate (%)"
+        colors = ["red", "yellow", "green"]
         vals = pd.to_numeric(df["vacancy_pct"], errors="coerce")
         vmin = float(np.nanpercentile(vals, 1)) if vals.notna().any() else 0.0
         vmax = float(np.nanpercentile(vals, 99)) if vals.notna().any() else 1.0
         df_render = df.copy()
 
     elif map_mode == "Commute only":
-        metric_col = "avg_travel_min_eff"; legend = "Commute time from origin (min)"; colors = ["green","yellow","red"]
+        metric_col = "avg_travel_min_eff"
+        legend = "Commute time from origin (min)"
+        colors = ["green", "yellow", "red"]
         vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
         vmin = 0.0
         vmax = float(np.nanpercentile(vals, 99)) if vals.notna().any() else 120.0
         df_render = df.dropna(subset=[metric_col]).copy()
 
     else:
-        metric_col = "preference_score"; legend = "Preference score (0–100)"; colors = ["red","yellow","green"]
+        metric_col = "preference_score"
+        legend = "Preference score (0–100)"
+        colors = ["red", "yellow", "green"]
 
         if "manual_weights" in st.session_state:
             w0 = float(st.session_state["manual_weights"].get("w0", 0.0))
-            a  = float(st.session_state["manual_weights"].get("w_v", 2.0))
-            b  = float(st.session_state["manual_weights"].get("w_t", 2.0))
-            v_lo, v_hi = float(st.session_state["manual_weights"].get("v_min", v_range[0])), float(st.session_state["manual_weights"].get("v_max", v_range[1]))
-            t_lo, t_hi = float(st.session_state["manual_weights"].get("t_min", t_range[0])), float(st.session_state["manual_weights"].get("t_max", t_range[1]))
+            a = float(st.session_state["manual_weights"].get("w_v", 2.0))
+            b = float(st.session_state["manual_weights"].get("w_t", 2.0))
+            v_lo, v_hi = float(st.session_state["manual_weights"].get("v_min", v_range[0])), float(
+                st.session_state["manual_weights"].get("v_max", v_range[1])
+            )
+            t_lo, t_hi = float(st.session_state["manual_weights"].get("t_min", t_range[0])), float(
+                st.session_state["manual_weights"].get("t_max", t_range[1])
+            )
         else:
             w0, a, b = resolve_prior(meta, st.session_state)
-            v_lo, v_hi = v_range; t_lo, t_hi = t_range
+            v_lo, v_hi = v_range
+            t_lo, t_hi = t_range
 
         v_all = norm01_clipped(pd.to_numeric(df["vacancy_pct"], errors="coerce").values, v_lo, v_hi)
-        t_all = norm01_clipped(pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi)
+        t_all = norm01_clipped(
+            pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi
+        )
         pen_t = commute_penalty_shape(t_all, penalty_k)
-        util  = (w0 + a * v_all - b * pen_t)
+        util = w0 + a * v_all - b * pen_t
 
         finite = np.isfinite(util)
         if finite.any():
@@ -387,32 +494,51 @@ with tab_map:
 
     # Folium renderer
     def render_folium(df_map):
-        import folium, branca.colormap as bcm
-        from streamlit_folium import st_folium
+        import branca.colormap as bcm
+        import folium
         import streamlit.components.v1 as components
+        from streamlit_folium import st_folium
 
-        colormap = bcm.LinearColormap(colors=colors, vmin=vmin, vmax=vmax); colormap.caption = legend
+        colormap = bcm.LinearColormap(colors=colors, vmin=vmin, vmax=vmax)
+        colormap.caption = legend
         m = folium.Map(location=[46.8, 8.2], zoom_start=7, tiles="OpenStreetMap")
 
         if metric_col == "vacancy_pct":
             df_map["vacancy_round"] = pd.to_numeric(df_map["vacancy_pct"], errors="coerce").round(2)
-            fields, aliases = ["GEMEINDE_NAME","vacancy_round"], ["Municipality","Vacancy (%)"]
+            fields, aliases = ["GEMEINDE_NAME", "vacancy_round"], ["Municipality", "Vacancy (%)"]
         elif metric_col == "avg_travel_min_eff":
-            df_map["time_round"] = pd.to_numeric(df_map["avg_travel_min_eff"], errors="coerce").round(1)
-            fields, aliases = ["GEMEINDE_NAME","time_round"], ["Municipality","Commute (min)"]
+            df_map["time_round"] = pd.to_numeric(
+                df_map["avg_travel_min_eff"], errors="coerce"
+            ).round(1)
+            fields, aliases = ["GEMEINDE_NAME", "time_round"], ["Municipality", "Commute (min)"]
         else:
-            df_map["score_round"] = pd.to_numeric(df_map["preference_score"], errors="coerce").round(1)
+            df_map["score_round"] = pd.to_numeric(
+                df_map["preference_score"], errors="coerce"
+            ).round(1)
             df_map["vacancy_round"] = pd.to_numeric(df_map["vacancy_pct"], errors="coerce").round(2)
-            df_map["time_round"] = pd.to_numeric(df_map["avg_travel_min_eff"], errors="coerce").round(1)
-            fields, aliases = ["GEMEINDE_NAME","score_round","vacancy_round","time_round"], ["Municipality","Score","Vacancy (%)","Commute (min)"]
+            df_map["time_round"] = pd.to_numeric(
+                df_map["avg_travel_min_eff"], errors="coerce"
+            ).round(1)
+            fields, aliases = ["GEMEINDE_NAME", "score_round", "vacancy_round", "time_round"], [
+                "Municipality",
+                "Score",
+                "Vacancy (%)",
+                "Commute (min)",
+            ]
 
         folium.GeoJson(
             data=df_map.to_json(),
             style_function=lambda feat: {
-                "fillColor": colormap(float(feat["properties"].get(metric_col))) if feat["properties"].get(metric_col) is not None else "#cccccc",
-                "color": "white", "weight": 0.2, "fillOpacity": 0.85
+                "fillColor": (
+                    colormap(float(feat["properties"].get(metric_col)))
+                    if feat["properties"].get(metric_col) is not None
+                    else "#cccccc"
+                ),
+                "color": "white",
+                "weight": 0.2,
+                "fillOpacity": 0.85,
             },
-            tooltip=folium.features.GeoJsonTooltip(fields=fields, aliases=aliases, localize=True)
+            tooltip=folium.features.GeoJsonTooltip(fields=fields, aliases=aliases, localize=True),
         ).add_to(m)
         colormap.add_to(m)
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-import subprocess, sys, os
+import os
+import subprocess
+import sys
+
 ROOT = os.path.dirname(os.path.dirname(__file__))
 APP = os.path.join(ROOT, "app", "app.py")
 
