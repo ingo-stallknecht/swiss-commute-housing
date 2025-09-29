@@ -1,25 +1,28 @@
-# Normalize to LF in the repo, checkout CRLF on Windows
+# --- Default behavior ---
+# Normalize to LF in the repo, checkout CRLF on Windows if needed
 * text=auto
 
-# Force LF for code & text
-*.py   text eol=lf
+# --- Force LF for code & text files ---
+*.py    text eol=lf
 *.ipynb text eol=lf
-*.md   text eol=lf
-*.yml  text eol=lf
-*.yaml text eol=lf
-*.json text eol=lf
-*.csv  text eol=lf
-*.toml text eol=lf
-*.ini  text eol=lf
-*.cfg  text eol=lf
-*.sh   text eol=lf
-*.bat  text eol=crlf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.csv   text eol=lf
+*.toml  text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+*.sh    text eol=lf
 
-# Binary (no line-ending changes)
+# --- Windows batch scripts keep CRLF ---
+*.bat   text eol=crlf
+
+# --- Binary files (no line-ending conversion, no diff) ---
 *.parquet -text
 *.geojson -text
-*.png  -text
-*.jpg  -text
-*.jpeg -text
-*.zip  -text
-*.pkl  -text
+*.png     -text
+*.jpg     -text
+*.jpeg    -text
+*.zip     -text
+*.pkl     -text
