@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import geopandas as gpd
@@ -101,6 +100,39 @@ def answers_signature(choices_dict):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def read_geojson_robust(path: str | Path):
+    """
+    Read GeoJSON reliably across environments.
+
+    Order:
+      1) Fiona (most reliable on Streamlit Cloud)
+      2) Pyogrio (fast locally)
+      3) Pure-Python JSON -> GeoDataFrame
+    """
+    p = str(path)
+    # 1) Fiona
+    try:
+        return gpd.read_file(p, engine="fiona")
+    except Exception:
+        pass
+    # 2) Pyogrio
+    try:
+        return gpd.read_file(p, engine="pyogrio")
+    except Exception:
+        pass
+    # 3) Pure-Python fallback
+    with open(p, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+    crs = gj.get("crs", None)
+    crs_epsg = None
+    if isinstance(crs, dict) and "properties" in crs and "name" in crs["properties"]:
+        crs_epsg = crs["properties"]["name"]
+    gdf = gpd.GeoDataFrame.from_features(gj["features"])
+    if crs_epsg:
+        gdf.set_crs(crs_epsg, inplace=True)
+    return gdf
+
+
 @st.cache_data(show_spinner=False)
 def build_anchor_pairs(v_range, t_range, n_each=3, dv_n=0.18, dt_n=0.10):
     v_lo, v_hi = v_range
@@ -186,12 +218,15 @@ def load_data():
         st.error("Artifacts not found. Re-run the export/build step.")
         st.stop()
 
-    g = gpd.read_file(str(gj))
+    # Robust reader to avoid pyogrio issues on Streamlit Cloud
+    g = read_geojson_robust(gj)
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
+
     for c in ["vacancy_pct", "avg_travel_min", "preference_score"]:
         if c in g.columns:
             g[c] = pd.to_numeric(g[c], errors="coerce")
+
     meta = json.loads((mj).read_text(encoding="utf-8"))
 
     # Try Parquet first, then CSV
@@ -432,7 +467,7 @@ with tab_data:
     cols = [c for c in cols if c in show.columns]
     st.dataframe(
         show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
-        use_container_width=True,
+        width="stretch",
     )
     st.caption(f"Total rows: {len(show)}")
 

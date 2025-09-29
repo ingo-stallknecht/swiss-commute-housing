@@ -19,6 +19,7 @@ Interactive **Streamlit app** to explore the trade-off between **housing availab
 ## 🚀 Live Demo
 
 👉 **Streamlit App:** [Live link here](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
+
 👉 **Colab Notebook:** [Notebook link here](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/swiss_commute_housing.ipynb)
 
 📸 *Screenshot of the app interface:*
