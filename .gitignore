@@ -29,3 +29,8 @@ Thumbs.db
 data/gemeinden_cache.geojson
 data/gtfs/**
 data/artifacts/**
+
+# Local caches / large raw
+data/gemeinden_cache.geojson
+data/gtfs/**
+data/artifacts/**
