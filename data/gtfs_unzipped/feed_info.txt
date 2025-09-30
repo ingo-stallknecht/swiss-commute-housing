@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version
+SBB,http://www.sbb.ch,de,20241215,20251213,Fahrplan 2025
