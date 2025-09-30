@@ -27,15 +27,13 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Lint & format (Python files only)
+      - name: Lint & format (Python code only)
         run: |
           pip install black isort
-          # Run black only on source, scripts, and app dirs
-          black --check app/ scripts/ src/ setup.py
-          # Run isort on the same
-          isort --check-only app/ scripts/ src/ setup.py --profile black --line-length 100
+          # only lint code dirs that actually exist
+          black --check app scripts src
+          isort --check-only app scripts src --profile black --line-length 100
 
-      # Optional: quick artifact build if raw inputs are present in CI
       - name: Smoke build artifacts (skip if raw missing)
         run: |
           if [ -f data/raw/gtfs_train.zip ] && [ -f data/raw/rent_gemeinde.csv ]; then
