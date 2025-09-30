@@ -1,4 +1,4 @@
-# 🏠🚆 Swiss Housing & Commute Explorer
+# Swiss Housing & Commute Explorer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
@@ -17,18 +17,18 @@ Interactive **Streamlit app** to explore the trade-off between **housing availab
 
 ---
 
-## 🚀 Live Demo
+## Live Demo
 
-👉 **Streamlit App:** [Try it here](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
+**Streamlit App:** [Try it here](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
 
-👉 **Colab Notebook:** [Explore on Colab](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/swiss_commute_housing.ipynb)
+**Colab Notebook:** [Explore on Colab](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/swiss_commute_housing.ipynb)
 
-📸 *Screenshot of the app interface:*
+*Screenshot of the app interface:*
 ![App Screenshot](assets/screenshot_app.png)
 
 ---
 
-## 🧩 Problem Statement
+## Problem Statement
 
 Housing decisions balance **availability** and **accessibility**.
 This tool helps answer:
@@ -37,7 +37,7 @@ This tool helps answer:
 
 ---
 
-## ⚙️ Technical Approach
+## Technical Approach
 
 This project demonstrates a full **data → geospatial → scoring → deployment** pipeline:
 
@@ -76,20 +76,20 @@ The pipeline (`scripts/make_artifacts.py`) exports:
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 - **Interactive map dashboard**:
   - Switch views: *preference score*, *housing vacancy only*, *commute time only*
   - Adjust **commute penalty curvature** and **origin SBB station**
   - Elicit preferences by answering A/B trade-off questions
 
-📸 *Example views:*
+*Example views:*
 - Housing only heatmap → ![Housing Heatmap](assets/map_housing_only.png)
 - Commute only heatmap → ![Commute Heatmap](assets/map_commute_only.png)
 
 ---
 
-## 🛠️ How to Run Locally
+## How to Run Locally
 
 Clone, install, add data, build artifacts, run the app:
 
