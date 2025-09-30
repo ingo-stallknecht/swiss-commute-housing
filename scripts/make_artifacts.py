@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -21,12 +23,17 @@ DATA = ROOT / "data"
 APP_DATA = ROOT / "app" / "data"
 ARTIFACTS = DATA / "artifacts"
 
-VACANCY_CSV = DATA / "vacancy_municipality.csv"
-GEMEINDEN_CACHE = DATA / "gemeinden_cache.geojson"
+# Inputs you already have/expect
+VACANCY_CSV = DATA / "vacancy_municipality.csv"  # BFS SDMX export (semicolon)
+GEMEINDEN_CACHE = DATA / "gemeinden_cache.geojson"  # local cache (recommended)
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+# If the cache is missing, we’ll auto-download a clean snapshot once:
+OD_URL = (
+    "https://data.opendatasoft.com/explore/dataset/"
+    "georef-switzerland-gemeinde-millesime%40public/download/?format=geojson"
+)
+
+# ------------------------------- utils ---------------------------------------
 
 
 def ensure_dirs():
@@ -34,35 +41,74 @@ def ensure_dirs():
     APP_DATA.mkdir(parents=True, exist_ok=True)
 
 
-def robust_read_csv(path: Path) -> pd.DataFrame:
-    """Try default CSV; if a single mega-column, re-read as semicolon SDMX."""
-    df = pd.read_csv(path, engine="python")
-    if len(df.columns) == 1:
-        df = pd.read_csv(path, sep=";", engine="python")
+def _read_text_any(path: Path) -> str | None:
+    for enc in ("utf-8-sig", "utf-8", "latin1"):
+        try:
+            return path.read_text(encoding=enc)
+        except Exception:
+            pass
+    return None
+
+
+def read_bfs_sdmx_csv(path: Path) -> pd.DataFrame:
+    """
+    Robust reader for BFS SDMX-style CSV (semicolon; header not always first line).
+    """
+    txt = _read_text_any(path)
+    if txt is None:
+        raise IOError(f"Cannot read file: {path}")
+    lines = txt.splitlines()
+    hdr_pat = re.compile(r"(TIME_PERIOD|Zeitperiode).*(OBS_VALUE|Beobachtungswert)", re.I)
+    hdr_idx = 0
+    for i, ln in enumerate(lines[:200]):
+        if hdr_pat.search(ln):
+            hdr_idx = i
+            break
+    df = pd.read_csv(io.StringIO("\n".join(lines[hdr_idx:])), sep=";", engine="python", dtype=str)
     return df
 
 
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    """Great-circle distance (km)."""
-    R = 6371.0
-    p = math.pi / 180.0
-    dlat = (lat2 - lat1) * p
-    dlon = (lon2 - lon1) * p
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+def parse_percent(x):
+    """'0,51' → 0.51 ; '51' → 51.0 (we will not divide by 100 here; BFS already in %)"""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    s = str(x).strip().replace("\xa0", " ").replace("%", "").strip()
+    s = s.replace("’", "").replace("'", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def norm_name(s: str) -> str:
+    import unicodedata as ucn
+
+    if pd.isna(s):
+        return ""
+    s = (
+        str(s)
+        .replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("Ä", "ae")
+        .replace("Ö", "oe")
+        .replace("Ü", "ue")
+        .replace("ß", "ss")
+    )
+    s = ucn.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Za-z0-9]+", "", s).lower()
 
 
 def norm01(x, lo=None, hi=None):
     x = np.asarray(pd.to_numeric(x, errors="coerce"), dtype="float64")
+    f = x[np.isfinite(x)]
     if lo is None or hi is None:
-        finite = x[np.isfinite(x)]
-        if finite.size == 0:
+        if f.size == 0:
             return np.zeros_like(x)
-        lo = float(np.nanpercentile(finite, 1))
-        hi = float(np.nanpercentile(finite, 99))
+        lo = float(np.nanpercentile(f, 1))
+        hi = float(np.nanpercentile(f, 99))
         if hi <= lo:
-            lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+            lo, hi = float(np.nanmin(f)), float(np.nanmax(f))
             if hi <= lo:
                 hi = lo + 1.0
     lo, hi = float(lo), float(hi)
@@ -76,120 +122,165 @@ def commute_penalty(t_norm: np.ndarray, k: float) -> np.ndarray:
     return 1.0 - np.power(1.0 - t, kk)
 
 
-# ------------------------------------------------------------
-# Load Gemeinde polygons
-# ------------------------------------------------------------
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    p = math.pi / 180.0
+    dlat = (lat2 - lat1) * p
+    dlon = (lon2 - lon1) * p
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+# -------------------------- geometry loading ---------------------------------
+
+
+def _download_gemeinden_if_needed() -> Path:
+    if GEMEINDEN_CACHE.exists():
+        return GEMEINDEN_CACHE
+    print("▶ Gemeinden cache missing — downloading once from Opendatasoft …")
+    import urllib.request
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(OD_URL) as resp:
+        raw = resp.read()
+    GEMEINDEN_CACHE.write_bytes(raw)
+    return GEMEINDEN_CACHE
 
 
 def load_gemeinden_geo() -> gpd.GeoDataFrame:
-    """
-    Load Gemeinde polygons from local cache. If you need to (re)create this
-    cache from OGD, do it once locally and commit only the simplified artifact.
-    """
-    if not GEMEINDEN_CACHE.exists():
-        raise FileNotFoundError(
-            f"Missing {GEMEINDEN_CACHE}. Create it once locally (download OGD polygons) "
-            "or copy an existing cache into data/."
-        )
-    g = gpd.read_file(GEMEINDEN_CACHE)
+    p = _download_gemeinden_if_needed()
+    gdf_all = gpd.read_file(p)[["gem_name", "gem_code", "kan_code", "year", "geometry"]].rename(
+        columns={
+            "gem_name": "GEMEINDE_NAME",
+            "gem_code": "GEMEINDE_CODE",
+            "kan_code": "KANTON_CODE",
+        }
+    )
+    latest = gdf_all["year"].max()
+    g = (
+        gdf_all[gdf_all["year"] == latest]
+        .sort_values(["GEMEINDE_CODE", "year"])
+        .drop_duplicates("GEMEINDE_CODE", keep="last")
+        .copy()
+    )
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
-
-    # Try to normalize ID & name columns
-    # Common OGD schema: 'GEMEINDE_CODE' (BFS code), 'GEMEINDE_NAME'
-    candidates_id = [
-        "GEMEINDE_CODE",
-        "BFS",
-        "BFSNR",
-        "GMDNR",
-        "bfs",
-        "GR_KT_GDE",  # last resort (present in your vacancy CSV too)
-    ]
-    candidates_name = ["GEMEINDE_NAME", "NAME", "NAME_DE", "gemname"]
-
-    g_cols = {c.lower(): c for c in g.columns}
-    gid = next((g_cols[c.lower()] for c in candidates_id if c.lower() in g_cols), None)
-    gname = next((g_cols[c.lower()] for c in candidates_name if c.lower() in g_cols), None)
-
-    if gid is None:
-        raise KeyError(
-            "Could not find a Gemeinde code column in polygons. Expect one of "
-            f"{candidates_id}. Got: {list(g.columns)}"
-        )
-    if gname is None:
-        # not fatal; we can proceed without it
-        gname = gid
-
-    g = g.rename(columns={gid: "GEMEINDE_CODE", gname: "GEMEINDE_NAME"})
     g["GEMEINDE_CODE"] = g["GEMEINDE_CODE"].astype(str)
-
     return g
 
 
-# ------------------------------------------------------------
-# Vacancy loader (handles BFS SDMX)
-# ------------------------------------------------------------
+# ------------------------- vacancy parsing/join -------------------------------
 
 
-def _load_vacancy() -> Tuple[pd.DataFrame, dict]:
-    """
-    Parse BFS SDMX export (semicolon-separated) and extract vacancy percentage
-    per municipality for the latest available year.
-
-    Uses:
-      - code: GR_KT_GDE
-      - name: Grossregionen, Kantone, Bezirke und Gemeinden
-      - measure: MEASURE_DIMENSION == 'PC'
-      - type: LEERWOHN_TYP == '_T'
-      - value: OBS_VALUE
-      - year: TIME_PERIOD (take latest)
-    """
+def load_vacancy_latest() -> tuple[pd.DataFrame, dict]:
     if not VACANCY_CSV.exists():
         raise FileNotFoundError(f"Missing vacancy CSV: {VACANCY_CSV}")
+    df = read_bfs_sdmx_csv(VACANCY_CSV)
 
-    df = robust_read_csv(VACANCY_CSV)
-    cols = list(df.columns)
-    print("▶ Vacancy CSV columns:", cols)
+    # try both DE/EN label variants seen in BFS exports
+    C_NAME = next((c for c in df.columns if "Grossregionen" in c or "Gemeinden" in c), None)
+    C_CODE = "GR_KT_GDE" if "GR_KT_GDE" in df.columns else None
+    C_MEAS = "MEASURE_DIMENSION" if "MEASURE_DIMENSION" in df.columns else None
+    C_TYPE = "LEERWOHN_TYP" if "LEERWOHN_TYP" in df.columns else None
+    C_VAL = (
+        "OBS_VALUE"
+        if "OBS_VALUE" in df.columns
+        else ("Beobachtungswert" if "Beobachtungswert" in df.columns else None)
+    )
+    C_YEAR = "TIME_PERIOD" if "TIME_PERIOD" in df.columns else None
 
-    # Detect columns we need
-    col_code = "GR_KT_GDE"  # present in your probe
-    col_name = "Grossregionen, Kantone, Bezirke und Gemeinden"
-    col_meas = "MEASURE_DIMENSION"
-    col_type = "LEERWOHN_TYP"
-    col_val = "OBS_VALUE"
-    col_year = "TIME_PERIOD"
+    req = [C_NAME, C_VAL, C_YEAR]
+    if any(x is None for x in req):
+        raise KeyError(f"Vacancy CSV missing expected columns; got: {list(df.columns)}")
 
-    for req in [col_code, col_name, col_meas, col_type, col_val, col_year]:
-        if req not in df.columns:
-            raise KeyError(f"Vacancy file missing '{req}'. Present columns: {list(df.columns)}")
-
-    # Filter PC (percentage), total type, latest year
+    # filter: measurement=PC (percent), type=_T (total) when present
     sel = df.copy()
-    sel = sel[sel[col_meas].astype(str).str.upper().eq("PC")]
-    sel = sel[sel[col_type].astype(str).str.upper().eq("_T")]
-    years = pd.to_numeric(sel[col_year], errors="coerce")
-    latest = int(years.max())
+    if C_MEAS and C_MEAS in sel.columns:
+        sel = sel[sel[C_MEAS].astype(str).str.upper().eq("PC")]
+    if C_TYPE and C_TYPE in sel.columns:
+        sel = sel[sel[C_TYPE].astype(str).str.upper().eq("_T")]
+
+    years = pd.to_numeric(sel[C_YEAR], errors="coerce")
+    latest = int(np.nanmax(years))
     sel = sel[years.eq(latest)].copy()
 
-    # Build result
-    sel["GEMEINDE_CODE"] = sel[col_code].astype(str)
-    sel["GEMEINDE_NAME"] = sel[col_name].astype(str)
-    sel["vacancy_pct"] = pd.to_numeric(sel[col_val], errors="coerce")
+    sel["key_name"] = sel[C_NAME].astype(str).str.strip()
+    sel["vacancy_pct"] = sel[C_VAL].map(parse_percent)
 
-    out = (
-        sel[["GEMEINDE_CODE", "GEMEINDE_NAME", "vacancy_pct"]]
-        .groupby(["GEMEINDE_CODE", "GEMEINDE_NAME"], as_index=False)
-        .mean()
-    )
+    if C_CODE and C_CODE in sel.columns:
+        sel["GEMEINDE_CODE"] = sel[C_CODE].astype(str)
+    else:
+        sel["GEMEINDE_CODE"] = np.nan  # will rely on name join
+
+    out = sel[["GEMEINDE_CODE", "key_name", "vacancy_pct"]].copy()
     meta = {"vacancy_year": latest, "source": "BFS SDMX (PC, _T)"}
     return out, meta
 
 
-# ------------------------------------------------------------
-# Travel times (fallback: distance-based)
-# ------------------------------------------------------------
+def join_vacancy(g: gpd.GeoDataFrame, vac: pd.DataFrame) -> gpd.GeoDataFrame:
+    """
+    Join vacancy onto Gemeinde polygons:
+      1) by BFS code (authoritative if present)
+      2) fill remaining via normalized name match
+    Always guarantees 'vacancy_pct' exists in g.
+    """
+    g = g.copy()
+    vac = vac.copy()
 
-DEFAULT_ORIGINS = {
+    # Ensure the target column exists before any merges
+    if "vacancy_pct" not in g.columns:
+        g["vacancy_pct"] = np.nan
+
+    # 1) by code
+    if "GEMEINDE_CODE" in vac.columns and vac["GEMEINDE_CODE"].notna().any():
+        vac_code = vac.dropna(subset=["GEMEINDE_CODE"]).copy()
+        vac_code["GEMEINDE_CODE"] = vac_code["GEMEINDE_CODE"].astype(str)
+        vac_code = vac_code[["GEMEINDE_CODE", "vacancy_pct"]].rename(
+            columns={"vacancy_pct": "vacancy_pct_code"}
+        )
+        g = g.merge(vac_code, on="GEMEINDE_CODE", how="left")
+        # prefer code-based values where available
+        if "vacancy_pct_code" in g.columns:
+            g["vacancy_pct"] = g["vacancy_pct"].combine_first(g["vacancy_pct_code"])
+            g.drop(columns=["vacancy_pct_code"], inplace=True)
+
+    # 2) fill remaining by normalized names
+    miss = g["vacancy_pct"].isna()
+    if miss.any():
+        tmp = vac.copy()
+        tmp["key_norm"] = tmp["key_name"].map(norm_name)
+        g["key_norm"] = g["GEMEINDE_NAME"].map(norm_name)
+        filled = g.loc[miss, ["key_norm"]].merge(
+            tmp[["key_norm", "vacancy_pct"]], on="key_norm", how="left"
+        )
+        g.loc[miss, "vacancy_pct"] = filled["vacancy_pct"].values
+        g.drop(columns=["key_norm"], inplace=True, errors="ignore")
+
+    # clean up known non-municipals if present
+    non_exact = {
+        "Zürichsee (ZH)",
+        "Thunersee",
+        "Brienzersee",
+        "Bielersee (BE)",
+        "Bielersee (NE)",
+        "Lac de Neuchâtel (BE)",
+        "Lac de Neuchâtel (NE)",
+        "Bodensee (SG)",
+        "Bodensee (TG)",
+        "Staatswald Galm",
+    }
+    mask_non = g["GEMEINDE_NAME"].isin(non_exact) | g["GEMEINDE_NAME"].str.contains(
+        r"^Comunanza\b", case=False, na=False
+    )
+    g.loc[mask_non, "vacancy_pct"] = np.nan
+
+    return g
+
+
+# -------------------------- distance-based travel -----------------------------
+
+DEFAULT_ORIGINS: Dict[str, tuple[float, float]] = {
     "Zürich HB": (47.378177, 8.540192),
     "Bern": (46.948824, 7.439132),
     "Basel SBB": (47.547451, 7.589626),
@@ -198,22 +289,41 @@ DEFAULT_ORIGINS = {
     "Luzern": (47.050168, 8.310229),
     "St. Gallen": (47.423180, 9.369775),
     "Winterthur": (47.499346, 8.724128),
+    "Zug": (47.172423, 8.517376),
+    "Biel/Bienne": (47.136669, 7.246791),
+    "Fribourg/Freiburg": (46.806477, 7.161971),
+    "Neuchâtel": (46.989987, 6.929273),
+    "Sion": (46.227388, 7.360625),
+    "Sierre/Siders": (46.294000, 7.535000),
+    "Brig": (46.319232, 7.988532),
+    "Visp": (46.293000, 7.881000),
+    "Chur": (46.853000, 9.529000),
+    "Bellinzona": (46.195000, 9.029000),
+    "Lugano": (46.004000, 8.950000),
+    "Arth-Goldau": (47.048000, 8.545000),
+    "Thun": (46.754000, 7.629000),
+    "Interlaken Ost": (46.690000, 7.869000),
+    "Schaffhausen": (47.697000, 8.633000),
+    "Solothurn": (47.207000, 7.537000),
+    "Aarau": (47.392000, 8.044000),
+    "Baden": (47.476000, 8.308000),
+    "Wil SG": (47.460000, 9.050000),
+    "Rapperswil SG": (47.226000, 8.817000),
+    "La Chaux-de-Fonds": (47.104000, 6.826000),
+    "Delémont": (47.363000, 7.344000),
 }
 
 
 def compute_distance_based_tt(
     g: gpd.GeoDataFrame,
-    origins: dict[str, tuple[float, float]],
+    origins: Dict[str, tuple[float, float]],
     cruise_kmh: float = 50.0,
     overhead_min: float = 10.0,
 ) -> pd.DataFrame:
-    """
-    Fallback travel times: straight-line distance / speed + overhead.
-    Produces a tidy table: [origin_name, GEMEINDE_CODE, avg_travel_min].
-    """
+    """Always produces a full table for all Gemeinden × origins (no NaNs)."""
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
-    cent = g.geometry.centroid
+    cent = g.geometry.representative_point()
     lat = cent.y.values
     lon = cent.x.values
 
@@ -223,86 +333,67 @@ def compute_distance_based_tt(
             [haversine_km(olat, olon, lat[i], lon[i]) for i in range(len(g))], dtype="float64"
         )
         tt_min = overhead_min + (dist_km / max(cruise_kmh, 1.0)) * 60.0
-        tmp = pd.DataFrame(
-            {
-                "origin_name": oname,
-                "GEMEINDE_CODE": g["GEMEINDE_CODE"].astype(str).values,
-                "avg_travel_min": tt_min,
-            }
+        rows.append(
+            pd.DataFrame(
+                {
+                    "origin_name": oname,
+                    "GEMEINDE_CODE": g["GEMEINDE_CODE"].astype(str).values,
+                    "avg_travel_min": tt_min,
+                }
+            )
         )
-        rows.append(tmp)
-
-    tto = pd.concat(rows, ignore_index=True)
-    return tto
+    return pd.concat(rows, ignore_index=True)
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# --------------------------------- main --------------------------------------
 
 
-def build_artifacts(
-    origins_csv: str,
-    default_origin: str,
-    penalty_k: float,
-    only_simplified: bool = True,
-) -> None:
+def build_artifacts(origins_csv: str, default_origin: str, penalty_k: float) -> None:
     ensure_dirs()
 
-    print("▶ Checking inputs …")
-    print(f"  • {VACANCY_CSV}: {'OK' if VACANCY_CSV.exists() else 'MISSING'}")
-    print(f"  • {GEMEINDEN_CACHE}: {'OK (local cache)' if GEMEINDEN_CACHE.exists() else 'MISSING'}")
-
+    print("▶ Loading Gemeinde polygons …")
     g = load_gemeinden_geo()
-    print(f"▶ Loading Gemeinde polygons …\n  → {len(g)} polygons")
+    print(f"  → {len(g)} municipalities")
 
-    v, vmeta = _load_vacancy()
-    print("▶ Read vacancy …")
+    print("▶ Parsing vacancy CSV …")
+    vac, vmeta = load_vacancy_latest()
+    print(f"  → latest year: {vmeta.get('vacancy_year')}")
 
-    # Join vacancy onto polygons (prefer code; fallback name)
-    g["GEMEINDE_CODE"] = g["GEMEINDE_CODE"].astype(str)
-    v["GEMEINDE_CODE"] = v["GEMEINDE_CODE"].astype(str)
-    g = g.merge(v[["GEMEINDE_CODE", "vacancy_pct"]], on="GEMEINDE_CODE", how="left")
+    print("▶ Joining vacancy …")
+    g = join_vacancy(g, vac)
+    print(
+        f"  → vacancy coverage: {g['vacancy_pct'].notna().mean():.3f} "
+        f"({g['vacancy_pct'].notna().sum()}/{len(g)})"
+    )
 
-    # Origins
+    # Origins list
     if origins_csv.strip():
-        origins_list = [s.strip() for s in origins_csv.split(";") if s.strip()]
+        requested = [s.strip() for s in origins_csv.split(";") if s.strip()]
     else:
-        origins_list = list(DEFAULT_ORIGINS.keys())
+        requested = list(DEFAULT_ORIGINS.keys())
+    origins = {name: DEFAULT_ORIGINS.get(name, DEFAULT_ORIGINS["Zürich HB"]) for name in requested}
 
-    # Make sure we have coordinates for the requested origins (use defaults when missing)
-    origins = {}
-    for o in origins_list:
-        if o in DEFAULT_ORIGINS:
-            origins[o] = DEFAULT_ORIGINS[o]
-        else:
-            # Use Zürich HB coords as a generic fallback
-            origins[o] = DEFAULT_ORIGINS["Zürich HB"]
-
-    # Compute travel times (fallback model)
     print("▶ Computing distance-based travel times …")
     tt_by_origin = compute_distance_based_tt(g, origins)
-
-    # Pick default origin times to embed in the simplified file
     if default_origin not in origins:
-        default_origin = origins_list[0]
+        default_origin = requested[0]
     tdef = tt_by_origin[tt_by_origin["origin_name"] == default_origin][
         ["GEMEINDE_CODE", "avg_travel_min"]
     ].copy()
 
+    # Attach default travel time to polygons
     g_out = g.merge(tdef, on="GEMEINDE_CODE", how="left")
 
-    # Preference score embedded (so the app can render immediately)
+    # Embed simple preference score (immediate mapability)
     v_n = norm01(g_out["vacancy_pct"])
     t_n = norm01(g_out["avg_travel_min"])
     pen = commute_penalty(t_n, penalty_k)
-    # Simple fixed weights; app can still re-weigh interactively
     w0, a, b = 0.0, 2.0, 2.0
     util = w0 + a * v_n - b * pen
     util = util - np.nanmedian(util[np.isfinite(util)])
     g_out["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
 
-    # Simplify geometry for a small artifact
+    # Simplify geometry for small file size
     try:
         g_simpl = g_out.to_crs(3857)
         g_simpl["geometry"] = g_simpl.geometry.simplify(200, preserve_topology=True)
@@ -320,27 +411,29 @@ def build_artifacts(
     ]
     g_simpl = g_simpl[keep]
 
-    # Write artifacts
     print("▶ Exporting artifacts …")
     simplified_path = ARTIFACTS / "gemeinden_simplified.geojson"
     g_simpl.to_file(simplified_path, driver="GeoJSON")
     print(f"  → wrote {simplified_path}")
 
-    # Copy into app/data
+    # Sync to app/data
+    APP_DATA.mkdir(parents=True, exist_ok=True)
     (APP_DATA / "gemeinden_simplified.geojson").write_text(
         simplified_path.read_text(encoding="utf-8"), encoding="utf-8"
     )
-    print("  → copied gemeinden_simplified.geojson to app/data/")
+    print("  → copied to app/data/gemeinden_simplified.geojson")
 
-    # tt_by_origin (for multiple origins in the app)
+    # Multi-origin matrix
     tt_parquet = APP_DATA / "tt_by_origin.parquet"
     tt_by_origin.to_parquet(tt_parquet, index=False)
-    print(f"  → wrote {tt_parquet}")
+    print(
+        f"  → wrote {tt_parquet} ({len(tt_by_origin):,} rows, {tt_by_origin['origin_name'].nunique()} origins)"
+    )
 
-    # meta
+    # Meta
     meta = {
         "origin_station": default_origin,
-        "penalty_k": penalty_k,
+        "penalty_k": float(penalty_k),
         "vacancy_year": vmeta.get("vacancy_year"),
         "canonical_weights": {"w0": 0.0, "a": 2.0, "b": 2.0},
     }
@@ -348,9 +441,7 @@ def build_artifacts(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print("  → wrote app/data/meta.json")
-
-    print("✅ Done. Artifacts in:", ARTIFACTS)
-    print("✅ App data synced to:", APP_DATA)
+    print("✅ Done.")
 
 
 def parse_args():
@@ -358,28 +449,17 @@ def parse_args():
     p.add_argument(
         "--origins",
         type=str,
-        default="Zürich HB;Bern;Basel SBB;Genève;Lausanne;Luzern;St. Gallen;Winterthur",
+        default=";".join(DEFAULT_ORIGINS.keys()),
+        help="Semicolon-separated list of origin station names (must be keys in DEFAULT_ORIGINS).",
     )
     p.add_argument("--default-origin", type=str, default="Zürich HB")
     p.add_argument("--penalty-k", type=float, default=1.5)
-    p.add_argument(
-        "--only-simplified",
-        action="store_true",
-        default=True,
-        help="Kept for compatibility; this builder always writes only simplified artifacts.",
-    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    ensure_dirs()
-    build_artifacts(
-        origins_csv=args.origins,
-        default_origin=args.default_origin,
-        penalty_k=args.penalty_k,
-        only_simplified=True,
-    )
+    build_artifacts(args.origins, args.default_origin, args.penalty_k)
 
 
 if __name__ == "__main__":

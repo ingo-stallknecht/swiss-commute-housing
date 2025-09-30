@@ -1,7 +1,6 @@
 # app/app.py
 # -*- coding: utf-8 -*-
 
-import codecs
 import hashlib
 import json
 from pathlib import Path
@@ -31,8 +30,8 @@ def robust_range(series_like, lo_q=1, hi_q=99):
     hi = float(np.nanpercentile(s, hi_q))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         lo, hi = float(np.nanmin(s)), float(np.nanmax(s))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = 0.0, 1.0
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = 0.0, 1.0
     return lo, hi
 
 
@@ -59,12 +58,12 @@ def enforce_origin_zero_and_shift(
     if "avg_travel_min" not in df.columns:
         df["avg_travel_min"] = np.nan
     df["avg_travel_min_eff"] = pd.to_numeric(df["avg_travel_min"], errors="coerce")
+
     if tt_sel is not None and not tt_sel.empty:
         tmp = tt_sel[["GEMEINDE_CODE", "avg_travel_min"]].copy()
         tmp["GEMEINDE_CODE"] = tmp["GEMEINDE_CODE"].astype(str)
         tmp = tmp.rename(columns={"avg_travel_min": "avg_travel_min_origin"})
         df = df.merge(tmp, on="GEMEINDE_CODE", how="left")
-        # prefer origin-specific where available
         origin_vals = pd.to_numeric(df["avg_travel_min_origin"], errors="coerce")
         base_vals = pd.to_numeric(df["avg_travel_min_eff"], errors="coerce")
         df["avg_travel_min_eff"] = np.where(np.isfinite(origin_vals), origin_vals, base_vals)
@@ -86,103 +85,55 @@ def answers_signature(choices_dict):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _looks_like_lfs_pointer(text_head: str) -> bool:
-    head = (text_head or "").strip().lower()
-    return head.startswith("version https://git-lfs.github.com/spec/v1")
-
-
-def _looks_like_html(text_head: str) -> bool:
-    h = (text_head or "").lstrip().lower()
-    return h.startswith("<!doctype html") or h.startswith("<html")
-
-
 def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"GeoJSON not found: {p}")
-    # fast path
     try:
-        return gpd.read_file(str(p))
+        return gpd.read_file(str(path))
     except Exception:
         pass
     try:
-        return gpd.read_file(str(p), engine="fiona")
+        return gpd.read_file(str(path), engine="fiona")
     except Exception:
         pass
-    raw = p.read_bytes()
+    raw = path.read_bytes()
     if len(raw) < 50:
-        raise ValueError(f"GeoJSON looks empty or truncated: {p} (size={len(raw)} bytes)")
-    head = raw[:200].decode("utf-8", errors="ignore")
-    if _looks_like_lfs_pointer(head):
-        raise ValueError(f"File appears to be a Git LFS pointer, not actual GeoJSON: {p}.")
-    if _looks_like_html(head):
-        raise ValueError(f"File looks like HTML, not GeoJSON: {p}.")
-    gj = None
-    try:
-        gj = json.loads(raw.decode("utf-8", errors="strict"))
-    except Exception:
-        for enc in ("utf-8-sig", "latin-1"):
-            try:
-                gj = json.loads(raw.decode(enc))
-                break
-            except Exception:
-                pass
+        raise ValueError(f"GeoJSON looks empty: {path}")
+    gj = json.loads(raw.decode("utf-8", errors="ignore"))
     if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection":
-        raise ValueError(f"Not a FeatureCollection: {p}")
+        raise ValueError(f"Not a FeatureCollection: {path}")
     feats = gj.get("features", [])
     if not feats:
-        raise ValueError(f"FeatureCollection has no features: {p}")
+        raise ValueError(f"No features in: {path}")
     return gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326")
 
 
 @st.cache_data(show_spinner=False)
 def load_data():
-    simplified = DATA_DIR / "gemeinden_simplified.geojson"
-    meta_path = DATA_DIR / "meta.json"
-    if not meta_path.exists():
-        st.error("Artifacts not found. Re-run the export/build step.")
-        st.stop()
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        meta = json.loads(codecs.open(meta_path, "r", "utf-8-sig").read())
-
-    errors = []
-    g = None
-    for candidate in [simplified]:
-        if candidate.exists():
-            try:
-                g = read_geojson_robust(candidate)
-                break
-            except Exception as e:
-                errors.append(f"{candidate.name}: {e}")
-    if g is None:
-        st.error("Unable to load GeoJSON artifacts.\n\n" + "\n".join(f"- {m}" for m in errors))
+    gj = DATA_DIR / "gemeinden_simplified.geojson"
+    mj = DATA_DIR / "meta.json"
+    if not gj.exists() or not mj.exists():
+        st.error("Artifacts not found. Run scripts/make_artifacts.py first.")
         st.stop()
 
+    g = read_geojson_robust(gj)
     if g.crs is None or str(g.crs).lower() != "epsg:4326":
         g = g.to_crs(4326)
-
     for c in ["vacancy_pct", "avg_travel_min", "preference_score"]:
         if c in g.columns:
             g[c] = pd.to_numeric(g[c], errors="coerce")
 
-    # dynamic origins
+    meta = json.loads(mj.read_text(encoding="utf-8"))
+
     tto = None
-    for f in [DATA_DIR / "tt_by_origin.parquet", DATA_DIR / "tt_by_origin.csv"]:
-        if f.exists():
-            try:
-                tto = pd.read_parquet(f) if f.suffix == ".parquet" else pd.read_csv(f)
-                break
-            except Exception:
-                continue
-    if tto is not None:
-        if "GEMEINDE_CODE" in tto.columns:
+    ttp = DATA_DIR / "tt_by_origin.parquet"
+    if ttp.exists():
+        try:
+            tto = pd.read_parquet(ttp)
             tto["GEMEINDE_CODE"] = tto["GEMEINDE_CODE"].astype(str)
-        if "avg_travel_min" in tto.columns:
             tto["avg_travel_min"] = pd.to_numeric(tto["avg_travel_min"], errors="coerce")
-        if "origin_name" not in tto.columns and "origin_station_id" in tto.columns:
-            tto["origin_name"] = tto["origin_station_id"].astype(str)
+            if "origin_name" not in tto.columns and "origin_station_id" in tto.columns:
+                tto["origin_name"] = tto["origin_station_id"].astype(str)
+        except Exception:
+            tto = None
 
     return g, meta, tto
 
@@ -221,12 +172,7 @@ with st.sidebar:
 
     map_mode = st.radio("Map mode", ["Preference score", "Housing only", "Commute only"])
     penalty_k = st.slider(
-        "Commute penalty curvature (k)",
-        0.2,
-        6.0,
-        float(meta.get("penalty_k", 1.5)),
-        0.1,
-        help="Adjusts the curvature used in Preference score.",
+        "Commute penalty curvature (k)", 0.2, 6.0, float(meta.get("penalty_k", 1.5)), 0.1
     )
 
 df = g.copy()
@@ -238,15 +184,14 @@ if (
     and origin_name in tt_by_origin["origin_name"].astype(str).unique()
 ):
     tt_sel = tt_by_origin.loc[
-        tt_by_origin["origin_name"].astype(str).eq(origin_name),
-        ["GEMEINDE_CODE", "avg_travel_min"],
+        tt_by_origin["origin_name"].astype(str).eq(origin_name), ["GEMEINDE_CODE", "avg_travel_min"]
     ].copy()
 else:
     tt_sel = None
 
 df = enforce_origin_zero_and_shift(df, tt_sel)
 
-# simplify (in case)
+# -> simplify polygons a bit for speed
 try:
     df["geometry"] = df.geometry.simplify(0.0005, preserve_topology=True)
 except Exception:
@@ -287,11 +232,11 @@ def build_edge_tradeoffs(_df, v_range, t_range, n=10, seed=42):
     t_lo, t_hi = t_range
     dfx["v_n"] = norm01_clipped(dfx["vacancy_pct"].values, v_lo, v_hi)
     dfx["t_n"] = norm01_clipped(dfx["avg_travel_min"].values, t_lo, t_hi)
+
     rng = np.random.default_rng(seed)
     used = set()
     rows = []
     tries = 0
-
     while len(rows) < n and tries < 8000:
         tries += 1
         A = dfx.sample(1, random_state=int(rng.integers(1, 1_000_000))).iloc[0]
@@ -366,7 +311,7 @@ with tab_pref:
                     index=None,
                 )
 
-# Track answers (optional quick-fit kept minimal)
+# record simple signature to avoid refit loops (future extension)
 choices_dict, answered_rows = {}, []
 for _, r in sc.iterrows():
     key = f"choice_{int(r.qid)}"
@@ -374,19 +319,7 @@ for _, r in sc.iterrows():
     if ch in ("A", "B"):
         choices_dict[key] = ch
         answered_rows.append(r)
-ans_sig = answers_signature(choices_dict) if choices_dict else None
-
-if answered_rows and st.session_state.get("answers_sig") != ans_sig:
-    st.session_state["manual_weights"] = {
-        "w0": 0.0,
-        "w_v": 2.0,
-        "w_t": 2.0,
-        "v_min": float(v_range[0]),
-        "v_max": float(v_range[1]),
-        "t_min": float(t_range[0]),
-        "t_max": float(t_range[1]),
-    }
-    st.session_state["answers_sig"] = ans_sig
+st.session_state["answers_sig"] = answers_signature(choices_dict) if choices_dict else None
 
 with tab_data:
     show = df.copy()
@@ -394,8 +327,8 @@ with tab_data:
     cols = ["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff", "preference_score"]
     cols = [c for c in cols if c in show.columns]
     st.dataframe(
-        show[cols].head(30).rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
-        width="stretch",
+        show[cols].rename(columns={"avg_travel_min_eff": "avg_travel_min"}),
+        use_container_width=True,
     )
     st.caption(f"Total rows: {len(show)}")
 
@@ -422,37 +355,30 @@ with tab_map:
         metric_col = "preference_score"
         legend = "Preference score (0–100)"
         colors = ["red", "yellow", "green"]
-
-        if "manual_weights" in st.session_state:
-            w0 = float(st.session_state["manual_weights"].get("w0", 0.0))
-            a = float(st.session_state["manual_weights"].get("w_v", 2.0))
-            b = float(st.session_state["manual_weights"].get("w_t", 2.0))
-            v_lo, v_hi = float(st.session_state["manual_weights"].get("v_min", v_range[0])), float(
-                st.session_state["manual_weights"].get("v_max", v_range[1])
-            )
-            t_lo, t_hi = float(st.session_state["manual_weights"].get("t_min", t_range[0])), float(
-                st.session_state["manual_weights"].get("t_max", t_range[1])
-            )
-        else:
-            w0, a, b = 0.0, 2.0, 2.0
+        # dynamic recompute allowed but we already embedded a default one; keep it simple:
+        vmin, vmax = 0.0, 100.0
+        df_render = df.dropna(subset=["vacancy_pct", "avg_travel_min_eff"]).copy()
+        if (
+            "preference_score" not in df_render.columns
+            or df_render["preference_score"].isna().all()
+        ):
+            # compute on the fly if missing
             v_lo, v_hi = v_range
             t_lo, t_hi = t_range
+            v_all = norm01_clipped(
+                pd.to_numeric(df_render["vacancy_pct"], errors="coerce").values, v_lo, v_hi
+            )
+            t_all = norm01_clipped(
+                pd.to_numeric(df_render["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi
+            )
+            pen_t = commute_penalty_shape(t_all, penalty_k=float(meta.get("penalty_k", 1.5)))
+            util = 0.0 + 2.0 * v_all - 2.0 * pen_t
+            finite = np.isfinite(util)
+            if finite.any():
+                util = util - np.median(util[finite])
+            df_render["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
 
-        v_all = norm01_clipped(pd.to_numeric(df["vacancy_pct"], errors="coerce").values, v_lo, v_hi)
-        t_all = norm01_clipped(
-            pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi
-        )
-        pen_t = commute_penalty_shape(t_all, penalty_k)
-        util = w0 + a * v_all - b * pen_t
-        finite = np.isfinite(util)
-        if finite.any():
-            util = util - np.median(util[finite])
-        df_render = df.copy()
-        df_render["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
-        vmin, vmax = 0.0, 100.0
-        df_render = df_render.dropna(subset=["preference_score"])
-
-    # Folium renderer
+    # Folium rendering
     def render_folium(df_map):
         import branca.colormap as bcm
         import folium
@@ -501,7 +427,6 @@ with tab_map:
             tooltip=folium.features.GeoJsonTooltip(fields=fields, aliases=aliases, localize=True),
         ).add_to(m)
         colormap.add_to(m)
-
         try:
             st_folium(m, height=720, width=None)
         except Exception:

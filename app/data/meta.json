@@ -1,6 +1,7 @@
 {
-  "origin_station": "Z\u00fcrich HB",
+  "origin_station": "Zürich HB",
   "penalty_k": 1.5,
+  "vacancy_year": 2025,
   "canonical_weights": {
     "w0": 0.0,
     "a": 2.0,

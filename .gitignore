@@ -37,3 +37,6 @@ data/artifacts/**
 
 # app big geojson (use simplified instead)
 app/data/gemeinden.geojson
+
+# local venv
+.venv/
