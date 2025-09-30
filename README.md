@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
+[![Tests](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml)
 [![CI](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml)
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
 ![Last Commit](https://img.shields.io/github/last-commit/ingo-stallknecht/swiss-commute-housing)
@@ -19,6 +20,7 @@ Interactive **Streamlit app** to explore the trade-off between **housing availab
 ## 🚀 Live Demo
 
 👉 **Streamlit App:** [Try it here](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
+
 👉 **Colab Notebook:** [Explore on Colab](https://colab.research.google.com/github/ingo-stallknecht/swiss-commute-housing/blob/main/notebooks/swiss_commute_housing.ipynb)
 
 📸 *Screenshot of the app interface:*
