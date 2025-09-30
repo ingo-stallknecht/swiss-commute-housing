@@ -1,12 +1,20 @@
 repos:
   - repo: https://github.com/psf/black
-    rev: 24.8.0
+    rev: 25.9.0
     hooks:
       - id: black
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
+        language_version: python3.11
+        args: ["--line-length=100"]
+        exclude: ^(notebooks/|app/data/|data/)
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 6.0.1
     hooks:
       - id: isort
+        name: isort (python)
+        args: ["--profile", "black", "--line-length=100"]
+        exclude: ^(notebooks/|app/data/|data/)
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
