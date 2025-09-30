@@ -390,7 +390,7 @@ df_scen = df[["GEMEINDE_NAME", "vacancy_pct", "avg_travel_min_eff"]].copy()
 df_scen = df_scen.rename(columns={"avg_travel_min_eff": "avg_travel_min"})
 sc = build_edge_tradeoffs(df_scen, v_range=v_range, t_range=t_range, n=10, seed=42)
 
-tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map", "🧭 Preference elicitation", "📄 Data"])
+tab_map, tab_pref, tab_data = st.tabs(["Map", "Preference elicitation", "Data"])
 
 with tab_pref:
     st.subheader("10 trade-off questions (your choices retrain the score)")
