@@ -85,6 +85,121 @@ def answers_signature(choices_dict):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+# ------- Preference learning helpers (new) -------
+
+
+def resolve_prior(meta, session_state):
+    """Pull prior weights from session (if any), else from meta canonical, else defaults."""
+    if "manual_weights" in session_state:
+        mw = session_state["manual_weights"]
+        return (
+            float(mw.get("w0", 0.0)),
+            float(max(0.0, mw.get("w_v", 2.0))),
+            float(max(0.0, mw.get("w_t", 2.0))),
+        )
+    try:
+        cw = meta.get("canonical_weights", {})
+        return (
+            float(cw.get("w0", 0.0)),
+            float(max(0.0, cw.get("a", 2.0))),
+            float(max(0.0, cw.get("b", 2.0))),
+        )
+    except Exception:
+        return (0.0, 2.0, 2.0)
+
+
+def build_anchor_pairs(v_range, t_range, n_each=3, dv_n=0.18, dt_n=0.10):
+    """A few synthetic A/B anchors so the fit stays well-posed and impactful."""
+    v_lo, v_hi = v_range
+    t_lo, t_hi = t_range
+    v_mid = (v_lo + v_hi) / 2.0
+    t_mid = (t_lo + t_hi) / 2.0
+    dv = dv_n * (v_hi - v_lo)
+    dt = dt_n * (t_hi - t_lo)
+    rows = []
+    for _ in range(n_each):
+        # same vacancy, commute±
+        rows.append(
+            {
+                "A_vacancy_pct": v_mid,
+                "A_travel_min": t_mid - dt,
+                "B_vacancy_pct": v_mid,
+                "B_travel_min": t_mid + dt,
+                "choice": "A",
+                "w": 0.25,
+            }
+        )
+        # same commute, vacancy±
+        rows.append(
+            {
+                "A_vacancy_pct": v_mid + dv,
+                "A_travel_min": t_mid,
+                "B_vacancy_pct": v_mid - dv,
+                "B_travel_min": t_mid,
+                "choice": "A",
+                "w": 0.25,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def fit_logistic_weighted(
+    sc_df,
+    v_range,
+    t_range,
+    k_ref,
+    prior=(0.0, 2.0, 2.0),
+    l2=0.05,
+    clip_w0=(-2.0, 2.0),
+    clip_a=(0.0, 6.0),
+    clip_b=(0.0, 6.0),
+    iters=900,
+    lr=0.30,
+):
+    """
+    Learn (w0, a, b) from pairwise A/B choices with penalty curvature k_ref.
+    Higher a → more weight on vacancy; higher b → stronger penalty on commute.
+    """
+    v_lo, v_hi = v_range
+    t_lo, t_hi = t_range
+    vA = sc_df["A_vacancy_pct"].values
+    vB = sc_df["B_vacancy_pct"].values
+    tA = sc_df["A_travel_min"].values
+    tB = sc_df["B_travel_min"].values
+    y = (sc_df["choice"].values == "A").astype(float)
+    w_samp = sc_df.get("w", pd.Series(1.0, index=sc_df.index)).values.astype("float64")
+
+    Va = norm01_clipped(vA, v_lo, v_hi)
+    Vb = norm01_clipped(vB, v_lo, v_hi)
+    Ta = norm01_clipped(tA, t_lo, t_hi)
+    Tb = norm01_clipped(tB, t_lo, t_hi)
+    Pa = commute_penalty_shape(Ta, k_ref)
+    Pb = commute_penalty_shape(Tb, k_ref)
+
+    # Model is: z = w0 + a*(Va-Vb) - b*(Pa-Pb)
+    X = np.column_stack([np.ones(len(sc_df)), (Va - Vb), -(Pa - Pb)])
+    w = np.array(prior, dtype="float64")
+    denom = max(1.0, np.sum(w_samp))
+
+    for _ in range(iters):
+        z = X @ w
+        p = 1.0 / (1.0 + np.exp(-z))
+        grad_ll = X.T @ ((y - p) * w_samp) / denom
+        grad_prior = -l2 * (w - np.array(prior))
+        w += lr * (grad_ll + grad_prior)
+        # Box constraints to keep impact meaningful but stable
+        w[0] = np.clip(w[0], *clip_w0)
+        w[1] = np.clip(w[1], *clip_a)
+        w[2] = np.clip(w[2], *clip_b)
+
+    w[1] = max(0.0, w[1])
+    w[2] = max(0.0, w[2])
+    return tuple(w)
+
+
+# ---------------- Data loading ----------------
+
+
 def read_geojson_robust(path: Path) -> gpd.GeoDataFrame:
     try:
         return gpd.read_file(str(path))
@@ -146,7 +261,8 @@ st.title("Swiss Housing & Commute Explorer")
 st.markdown(
     "Explore Swiss municipalities by combining **housing vacancy** and **commute time**. "
     "Three modes: **Preference score**, **Housing only**, **Commute only**. "
-    "Pick the **origin station** in the left sidebar."
+    "Pick the **origin station** in the left sidebar. Your answers in the *Preference elicitation* tab "
+    "actively retrain the scoring."
 )
 
 with st.sidebar:
@@ -174,7 +290,17 @@ with st.sidebar:
     penalty_k = st.slider(
         "Commute penalty curvature (k)", 0.2, 6.0, float(meta.get("penalty_k", 1.5)), 0.1
     )
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("Reset answers"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("choice_") or k in ("manual_weights", "answers_sig"):
+                    st.session_state.pop(k, None)
+            st.experimental_rerun()
+    with col_btn2:
+        st.caption("Answers instantly update scores")
 
+# Effective per-origin commute
 df = g.copy()
 df["GEMEINDE_CODE"] = df["GEMEINDE_CODE"].astype(str)
 
@@ -191,17 +317,18 @@ else:
 
 df = enforce_origin_zero_and_shift(df, tt_sel)
 
-# -> simplify polygons a bit for speed
+# simplify polygons for speed
 try:
     df["geometry"] = df.geometry.simplify(0.0005, preserve_topology=True)
 except Exception:
     pass
 
+# Ranges from EFFECTIVE data
 v_range = robust_range(df.get("vacancy_pct", np.nan))
 t_range = robust_range(df.get("avg_travel_min_eff", np.nan))
 
 
-# ---- Preference elicitation scenarios ----
+# ---- Build elicitation scenarios (same as before) ----
 def build_edge_tradeoffs(_df, v_range, t_range, n=10, seed=42):
     if isinstance(_df, (pd.DataFrame, gpd.GeoDataFrame)):
         dfx = _df.copy()
@@ -285,7 +412,7 @@ sc = build_edge_tradeoffs(df_scen, v_range=v_range, t_range=t_range, n=10, seed=
 tab_map, tab_pref, tab_data = st.tabs(["🗺️ Map", "🧭 Preference elicitation", "📄 Data"])
 
 with tab_pref:
-    st.subheader("10 trade-off questions")
+    st.subheader("10 trade-off questions (your choices retrain the score)")
     if sc.empty:
         st.warning("Not enough data to build scenarios.")
     else:
@@ -311,7 +438,7 @@ with tab_pref:
                     index=None,
                 )
 
-# record simple signature to avoid refit loops (future extension)
+# ---- Learn weights live when answers change ----
 choices_dict, answered_rows = {}, []
 for _, r in sc.iterrows():
     key = f"choice_{int(r.qid)}"
@@ -319,7 +446,55 @@ for _, r in sc.iterrows():
     if ch in ("A", "B"):
         choices_dict[key] = ch
         answered_rows.append(r)
-st.session_state["answers_sig"] = answers_signature(choices_dict) if choices_dict else None
+
+ans_sig = answers_signature(choices_dict) if choices_dict else None
+
+train_df = None
+if answered_rows:
+    user_sc = pd.DataFrame(answered_rows).reset_index(drop=True).copy()
+    user_sc["choice"] = [choices_dict[f"choice_{int(r.qid)}"] for _, r in user_sc.iterrows()]
+    user_sc["w"] = 1.0
+    anchors = build_anchor_pairs(
+        v_range, t_range, n_each=3, dv_n=0.20, dt_n=0.12
+    )  # slightly stronger anchors
+    train_df = pd.concat(
+        [
+            user_sc[
+                ["A_vacancy_pct", "A_travel_min", "B_vacancy_pct", "B_travel_min", "choice", "w"]
+            ],
+            anchors[
+                ["A_vacancy_pct", "A_travel_min", "B_vacancy_pct", "B_travel_min", "choice", "w"]
+            ],
+        ],
+        ignore_index=True,
+    )
+
+if (train_df is not None) and (st.session_state.get("answers_sig") != ans_sig):
+    prior = resolve_prior(meta, st.session_state)
+    try:
+        w0, a, b = fit_logistic_weighted(
+            train_df,
+            v_range=v_range,
+            t_range=t_range,
+            k_ref=float(penalty_k),
+            prior=prior,
+            l2=0.05,
+            iters=950,
+            lr=0.30,
+        )
+        st.session_state["manual_weights"] = {
+            "w0": float(w0),
+            "w_v": float(a),
+            "w_t": float(b),
+            "v_min": float(v_range[0]),
+            "v_max": float(v_range[1]),
+            "t_min": float(t_range[0]),
+            "t_max": float(t_range[1]),
+        }
+        st.session_state["answers_sig"] = ans_sig
+        st.toast(f"Updated weights → w0={w0:.2f}, a={a:.2f}, b={b:.2f}", icon="✅")
+    except Exception as e:
+        st.warning(f"Could not fit weights ({e}). Using defaults.")
 
 with tab_data:
     show = df.copy()
@@ -355,28 +530,36 @@ with tab_map:
         metric_col = "preference_score"
         legend = "Preference score (0–100)"
         colors = ["red", "yellow", "green"]
-        # dynamic recompute allowed but we already embedded a default one; keep it simple:
-        vmin, vmax = 0.0, 100.0
-        df_render = df.dropna(subset=["vacancy_pct", "avg_travel_min_eff"]).copy()
-        if (
-            "preference_score" not in df_render.columns
-            or df_render["preference_score"].isna().all()
-        ):
-            # compute on the fly if missing
+
+        # Use learned weights if present; otherwise prior defaults
+        if "manual_weights" in st.session_state:
+            w0 = float(st.session_state["manual_weights"].get("w0", 0.0))
+            a = float(st.session_state["manual_weights"].get("w_v", 2.0))
+            b = float(st.session_state["manual_weights"].get("w_t", 2.0))
+            v_lo = float(st.session_state["manual_weights"].get("v_min", v_range[0]))
+            v_hi = float(st.session_state["manual_weights"].get("v_max", v_range[1]))
+            t_lo = float(st.session_state["manual_weights"].get("t_min", t_range[0]))
+            t_hi = float(st.session_state["manual_weights"].get("t_max", t_range[1]))
+        else:
+            w0, a, b = resolve_prior(meta, st.session_state)
             v_lo, v_hi = v_range
             t_lo, t_hi = t_range
-            v_all = norm01_clipped(
-                pd.to_numeric(df_render["vacancy_pct"], errors="coerce").values, v_lo, v_hi
-            )
-            t_all = norm01_clipped(
-                pd.to_numeric(df_render["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi
-            )
-            pen_t = commute_penalty_shape(t_all, penalty_k=float(meta.get("penalty_k", 1.5)))
-            util = 0.0 + 2.0 * v_all - 2.0 * pen_t
-            finite = np.isfinite(util)
-            if finite.any():
-                util = util - np.median(util[finite])
-            df_render["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
+
+        v_all = norm01_clipped(pd.to_numeric(df["vacancy_pct"], errors="coerce").values, v_lo, v_hi)
+        t_all = norm01_clipped(
+            pd.to_numeric(df["avg_travel_min_eff"], errors="coerce").values, t_lo, t_hi
+        )
+        pen_t = commute_penalty_shape(t_all, penalty_k)  # **use the slider k**
+        util = w0 + a * v_all - b * pen_t
+
+        finite = np.isfinite(util)
+        if finite.any():
+            util = util - np.median(util[finite])  # center to keep 0–100 spread pleasant
+
+        df_render = df.copy()
+        df_render["preference_score"] = 100.0 * (1.0 / (1.0 + np.exp(-util)))
+        vmin, vmax = 0.0, 100.0
+        df_render = df_render.dropna(subset=["preference_score"])
 
     # Folium rendering
     def render_folium(df_map):
