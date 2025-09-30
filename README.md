@@ -91,7 +91,7 @@ The pipeline (`scripts/make_artifacts.py`) exports:
 
 ## 🛠️ How to Run Locally
 
-Clone, install, build artifacts, and run the app:
+Clone, install, add data, build artifacts, run the app:
 
 ```bash
 git clone https://github.com/ingo-stallknecht/swiss-commute-housing.git
@@ -99,17 +99,21 @@ cd swiss-commute-housing
 
 # Create and activate virtualenv
 python -m venv .venv
-source .venv/Scripts/activate   # Windows (Git Bash)
-# source .venv/bin/activate     # macOS/Linux
+# Windows (Git Bash):
+source .venv/Scripts/activate
+# macOS/Linux:
+# source .venv/bin/activate
 
+# Install deps and the package (editable)
 pip install -r requirements.txt
 pip install -e .
 
-# Place input data in data/raw/
-#   data/raw/rent_gemeinde.csv
-#   data/raw/gtfs_train.zip
+# --- Place input data in the repo's data/ folder ---
+# Required:
+#   data/vacancy_municipality.csv
+#   data/gtfs_train.zip
 
-# Build artifacts
+# Build artifacts (you can change the default origin if you like)
 python scripts/make_artifacts.py --default-origin "Zürich HB"
 
 # Run the app
