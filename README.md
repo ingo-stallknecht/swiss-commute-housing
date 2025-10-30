@@ -45,7 +45,7 @@ This project demonstrates a full **data → geospatial → scoring → deploymen
 - **Housing vacancy**: BFS *Leerwohnungszählung* (municipality-level vacancy shares).
   - BFS exports arrive as multi-header CSVs → parsed with a robust header detector.
 - **Public transport (GTFS)**: Official nationwide GTFS feed from SBB.
-  - Includes trains, trams, buses, ferries — not just trains.
+  - Includes trains, trams, buses, ferries.
   - Tables: `stops.txt`, `trips.txt`, `routes.txt`, `stop_times.txt`.
 - **Geospatial**: Municipality boundaries (Opendatasoft).
   - CRS conversions: LV95 (EPSG:2056) ↔ WGS84 (EPSG:4326).
