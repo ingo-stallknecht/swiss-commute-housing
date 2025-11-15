@@ -5,7 +5,7 @@
 [![Tests](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/tests.yml)
 [![CI](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ingo-stallknecht/swiss-commute-housing/actions/workflows/ci.yml)
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://swiss-commute-housing-ivg9a6hhq3j5gkaq9yintl.streamlit.app/)
-![Last Commit](https://img.shields.io/github/last-commit/ingo-stallknecht/swiss-commute-housing)
+![Last Commit](https://img.shields.io/github/last-commit/ingo-stallknecht/swiss-commute-housing?cacheSeconds=3600)
 
 Interactive **Streamlit app** to explore the trade-off between **housing availability** and **public transport accessibility** across Swiss municipalities.
 
