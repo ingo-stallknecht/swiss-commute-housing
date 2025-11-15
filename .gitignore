@@ -40,3 +40,7 @@ app/data/gemeinden.geojson
 
 # local venv
 .venv/
+
+# Temporary GTFS data
+notebooks/gtfs_tmp/
+notebooks/gtfs_tmp/*
